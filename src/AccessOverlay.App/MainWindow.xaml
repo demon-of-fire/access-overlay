@@ -1,0 +1,115 @@
+<Window x:Class="AccessOverlay.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="Access Overlay"
+        Height="{Binding WindowHeight, Source={x:Static app:App.Settings}, Mode=TwoWay}"
+        Width="{Binding WindowWidth, Source={x:Static app:App.Settings}, Mode=TwoWay}"
+        MinHeight="480" MinWidth="720"
+        Background="{DynamicResource BgBrush}"
+        FontFamily="Segoe UI"
+        xmlns:app="clr-namespace:AccessOverlay.App"
+        Closing="Window_Closing"
+        PreviewKeyDown="Window_PreviewKeyDown">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Background="{DynamicResource TitleBgBrush}"
+                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1" Padding="10,8">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal">
+                    <Button x:Name="CaptureBtn" Content="Capture foreground app (Ctrl+Alt+A)" Click="CaptureBtn_Click" FontWeight="SemiBold"/>
+                    <Button x:Name="GameScanBtn" Content="🎮 Game Scan (Ctrl+Alt+G)" Click="GameScanBtn_Click" Margin="8,0,0,0" FontWeight="SemiBold"/>
+                    <CheckBox x:Name="AutoFollowCheck" Content="Auto-follow app" Margin="12,0,0,0" VerticalAlignment="Center" Checked="AutoFollow_Changed" Unchecked="AutoFollow_Changed"/>
+                    <CheckBox x:Name="SpeakOnCaptureCheck" Content="Speak on capture" Margin="12,0,0,0" VerticalAlignment="Center" Checked="SpeakOnCapture_Changed" Unchecked="SpeakOnCapture_Changed"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock x:Name="NvdaStatusText" Foreground="{DynamicResource MutedBrush}" VerticalAlignment="Center"/>
+                    <Button x:Name="TestSpeechBtn" Content="Test speech" Margin="12,0,0,0" Click="TestSpeech_Click" Padding="8,3"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="270"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <Border Grid.Column="0" Background="{DynamicResource PanelBgBrush}"
+                    BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,1,0" Padding="10">
+                <StackPanel>
+                    <TextBlock Text="READER" Foreground="{DynamicResource AccentBrush}" FontSize="12" FontWeight="Bold" Margin="0,6,0,4"/>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="Text size" Foreground="{DynamicResource MutedBrush}" VerticalAlignment="Center" Width="60"/>
+                        <Slider x:Name="FontSlider" Minimum="12" Maximum="48" Width="120" ValueChanged="FontSlider_ValueChanged"/>
+                        <TextBlock x:Name="FontValueText" Foreground="{DynamicResource FgBrush}" Width="36" TextAlignment="Right" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <TextBlock Text="Theme" Foreground="{DynamicResource MutedBrush}" VerticalAlignment="Center" Width="60"/>
+                        <ComboBox x:Name="ThemeCombo" Width="120" SelectionChanged="ThemeCombo_SelectionChanged"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <TextBlock Text="Opacity" Foreground="{DynamicResource MutedBrush}" VerticalAlignment="Center" Width="60"/>
+                        <Slider x:Name="OpacitySlider" Minimum="0.4" Maximum="1.0" Width="120" ValueChanged="OpacitySlider_ValueChanged"/>
+                    </StackPanel>
+                    <Button x:Name="OpenOverlayBtn" Content="Open reader window" Margin="0,14,0,0" Click="OpenOverlayBtn_Click"/>
+                    <Button x:Name="CopyTextBtn" Content="Copy last text to clipboard" Margin="0,8,0,0" Click="CopyTextBtn_Click"/>
+
+                    <TextBlock Text="CAPTURE" Foreground="{DynamicResource AccentBrush}" FontSize="12" FontWeight="Bold" Margin="0,18,0,4"/>
+                    <TextBlock x:Name="LastSourceText" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="12"/>
+                    <TextBlock x:Name="LastSummaryText" Foreground="{DynamicResource FgBrush}" TextWrapping="Wrap" FontSize="12" Margin="0,4,0,0"/>
+
+                    <TextBlock Text="WEBSITES" Foreground="{DynamicResource AccentBrush}" FontSize="12" FontWeight="Bold" Margin="0,18,0,4"/>
+                    <TextBlock Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="12"
+                               Text="Pages load in the built-in browser, then get the same readable treatment. Click &quot;Read page&quot; once the page has loaded."/>
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <Button x:Name="WebGoBtn" Content="Open" Click="WebGo_Click" Padding="8,3"/>
+                        <Button x:Name="WebReadBtn" Content="Read page" Click="WebRead_Click" Padding="8,3" Margin="8,0,0,0"/>
+                    </StackPanel>
+                    <CheckBox x:Name="WebReadAfterLoadCheck" Content="Read automatically after load" Margin="0,8,0,0"/>
+
+                    <TextBlock Text="GAMES" Foreground="{DynamicResource AccentBrush}" FontSize="12" FontWeight="Bold" Margin="0,18,0,4"/>
+                    <TextBlock Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="12"
+                               Text="Game Scan uses OCR to read on-screen menus. Works with any game engine including Frostbite, Unreal, Source, and more."/>
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <Button x:Name="GameScanSideBtn" Content="Scan game now" Click="GameScanBtn_Click" Padding="8,3"/>
+                        <Button x:Name="GameSpeakAllBtn" Content="Read all" Click="GameSpeakAll_Click" Padding="8,3" Margin="8,0,0,0"/>
+                    </StackPanel>
+                    <CheckBox x:Name="GameAutoReadCheck" Content="Auto-announce new game text" Margin="0,8,0,0"
+                              Checked="GameAutoRead_Changed" Unchecked="GameAutoRead_Changed"/>
+                    <TextBlock x:Name="GameStatusText" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="11" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+
+            <Grid Grid.Column="1" Margin="0,0,0,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <DockPanel Grid.Row="0" Margin="8,8,8,6">
+                    <Button DockPanel.Dock="Right" Content="Read page" Click="WebRead_Click" Padding="10,4"/>
+                    <TextBox x:Name="UrlBox" Text="https://www.wikipedia.org" KeyDown="UrlBox_KeyDown"
+                             VerticalContentAlignment="Center"/>
+                </DockPanel>
+                <Border Grid.Row="1" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" Margin="8,0,8,8">
+                    <wv2:WebView2 x:Name="WebView" NavigationCompleted="WebView_NavigationCompleted"/>
+                </Border>
+            </Grid>
+        </Grid>
+
+        <StatusBar Grid.Row="2" Background="{DynamicResource TitleBgBrush}" Foreground="{DynamicResource MutedBrush}">
+            <StatusBarItem>
+                <TextBlock x:Name="StatusText" Text="Ready. Press Ctrl+Alt+A on any app to make it readable."/>
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>
