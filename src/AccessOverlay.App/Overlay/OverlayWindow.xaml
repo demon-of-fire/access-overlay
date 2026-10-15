@@ -16,6 +16,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <Border Grid.Row="0" Background="{DynamicResource TitleBgBrush}"
@@ -60,6 +61,7 @@
                  VirtualizingPanel.VirtualizationMode="Recycling"
                  PreviewKeyDown="Blocks_PreviewKeyDown"
                  MouseDoubleClick="Blocks_MouseDoubleClick"
+                 SelectionChanged="Blocks_SelectionChanged"
                  FocusVisualStyle="{x:Null}">
             <ListBox.ItemContainerStyle>
                 <Style TargetType="ListBoxItem">
@@ -118,11 +120,33 @@
             </ListBox.Resources>
         </ListBox>
 
-        <Border Grid.Row="2" Background="{DynamicResource TitleBgBrush}"
+        <!-- Live text input. Whatever you type here is pushed into the real edit
+             field in the app or page underneath, keystroke by keystroke. -->
+        <Border x:Name="EditBar" Grid.Row="2" Visibility="Collapsed"
+                Background="{DynamicResource SelBgBrush}"
+                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0" Padding="10,6">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button x:Name="EditApplyBtn" Content="Apply" Click="EditApply_Click" Padding="8,3" Margin="0,0,6,0"/>
+                    <Button x:Name="EditCancelBtn" Content="Cancel" Click="EditCancel_Click" Padding="8,3"/>
+                </StackPanel>
+                <TextBlock x:Name="EditLabelText" DockPanel.Dock="Left" VerticalAlignment="Center"
+                           Foreground="{DynamicResource FgBrush}" FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis" MaxWidth="260" Margin="0,0,8,0"/>
+                <TextBox x:Name="EditBox" AcceptsReturn="False" Padding="4,3"
+                         TextChanged="EditBox_TextChanged" KeyDown="EditBox_KeyDown"
+                         AutomationProperties.Name="Edit field value"/>
+                <PasswordBox x:Name="EditPasswordBox" Visibility="Collapsed" Padding="4,3"
+                             PasswordChanged="EditPasswordBox_PasswordChanged" KeyDown="EditBox_KeyDown"
+                             AutomationProperties.Name="Protected field value"/>
+            </DockPanel>
+        </Border>
+
+        <Border Grid.Row="3" Background="{DynamicResource TitleBgBrush}"
                 BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0">
             <DockPanel Margin="10,3">
                 <TextBlock x:Name="SpeechStatusText" DockPanel.Dock="Right" Foreground="{DynamicResource MutedBrush}" Margin="10,0,0,0"/>
-                <TextBlock Text="H: next heading · Shift+H: previous · Enter: press/read · E: edit field · F5: refresh · S: read all · Ctrl+C: copy · Esc: close"
+                <TextBlock Text="Enter/Space: press · type to edit fields · ←/→: change combo/spinner value · Esc: close · H: heading · F5: refresh · S: read all · Ctrl+C: copy"
                            Foreground="{DynamicResource MutedBrush}" FontSize="12"/>
             </DockPanel>
         </Border>

@@ -111,12 +111,12 @@ public static class OcrCaptureService
                 );
 
                     // If line looks like a button / menu option or short text, make it an interactive ControlBlock
-                if (LooksLikeGameMenuOption(lineText, true))
+                if (LooksLikeGameMenuOption(lineText, gameMode))
                 {
                     blocks.Add(new ControlBlock
                     {
                         Text = lineText,
-                        Role = "Game Menu Option",
+                        Role = gameMode ? "Game Menu Option" : "On-screen control",
                         State = "Clickable",
                         Depth = 0,
                         RuntimeTarget = target

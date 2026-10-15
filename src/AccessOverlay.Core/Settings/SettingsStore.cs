@@ -8,7 +8,7 @@ public sealed class AppSettings
     public double FontSize { get; set; } = 20;
     public string Theme { get; set; } = "HighContrast";
     public double Opacity { get; set; } = 0.92;
-    public bool AutoFollow { get; set; } = false;
+    public bool AutoFollow { get; set; } = true;
     public bool SpeakOnCapture { get; set; } = true;
     public string Hotkey { get; set; } = "Ctrl+Alt+A";
     public double WindowWidth { get; set; } = 760;

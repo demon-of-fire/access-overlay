@@ -49,6 +49,13 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     internal static extern bool IsWindowVisible(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    internal static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+
+    /// <summary>True when <paramref name="hwnd"/> is a descendant of <paramref name="parent"/>.</summary>
+    internal static bool IsChildWindow(IntPtr parent, IntPtr hwnd)
+        => parent != IntPtr.Zero && hwnd != IntPtr.Zero && IsChild(parent, hwnd);
+
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern IntPtr FindWindowEx(IntPtr parent, IntPtr childAfter, string? className, string? windowName);
 
@@ -88,13 +95,20 @@ internal static class NativeMethods
     }
 
     /// <summary>
-    /// Finds the WebView2 (Chromium) controller HWND anywhere under a parent window.
-    /// Chromium nests its windows (Chrome_WidgetWin_0 wrapper → Chrome_WidgetWin_1 with the
-    /// actual page). We prefer the one carrying a window title, since that is the page window
-    /// whose UI Automation tree contains the DOM.
+    /// Finds the Chromium content HWND anywhere under a parent window, or the parent
+    /// itself when it is already the browser widget. Chromium nests its windows
+    /// (Chrome_WidgetWin_0 wrapper → Chrome_WidgetWin_1 with the actual page). We prefer
+    /// the one carrying a window title, since that is the page window whose UI
+    /// Automation tree contains the DOM. Desktop apps built on the same engine
+    /// (various store/launcher clients) resolve the same way.
     /// </summary>
     internal static IntPtr FindWebView2Hwnd(IntPtr parent)
     {
+        var selfClass = GetWindowClassName(parent);
+        if (selfClass.StartsWith("Chrome_WidgetWin_", StringComparison.OrdinalIgnoreCase)
+            && GetWindowTextSafe(parent).Length > 0)
+            return parent;
+
         var queue = new Queue<IntPtr>();
         queue.Enqueue(parent);
         IntPtr fallback = IntPtr.Zero;

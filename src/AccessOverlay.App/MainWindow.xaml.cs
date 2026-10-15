@@ -24,18 +24,22 @@ public partial class MainWindow : Window
     private readonly HotkeyManager? _hotkey;
     private readonly HotkeyManager? _gameHotkey;
     private ForegroundWatcher? _watcher;
+    private LiveWatcher? _liveWatcher;
     private OverlayWindow? _overlay;
     private OverlayWindow? _gameOverlay;
     private ReadableDocument? _lastDoc;
     private IntPtr _lastSourceHwnd;
     private bool _lastSourceIsWeb;
-    private readonly System.Windows.Threading.DispatcherTimer _statusTimer;
+    private System.Windows.Threading.DispatcherTimer _statusTimer;
     private bool _captureInFlight;
     private bool _gameScanInFlight;
     private DateTime _lastAutoCapture = DateTime.MinValue;
     private bool _automationMode;
     private bool _pressExecuted;
     private bool _suppressAutoFollowPersistence;
+    /// <summary>Set when the user deliberately dismissed the reader; auto-refresh may update it in place but must never re-show it.</summary>
+    private bool _userHidden;
+    private DateTime _lastContentCapture = DateTime.MinValue;
     private ReadableDocument? _lastGameDoc;
     private System.Windows.Threading.DispatcherTimer? _gameAutoReadTimer;
 
@@ -55,9 +59,9 @@ public partial class MainWindow : Window
         OpacitySlider.Value = _settings.Opacity;
         ThemeCombo.ItemsSource = ThemeManager.Names;
         ThemeCombo.SelectedItem = _settings.Theme;
-        // Explicit hotkey mode: never capture or show a reader at startup.
-        _settings.AutoFollow = false;
-        AutoFollowCheck.IsChecked = false;
+        // Auto-follow is the default: the reader keeps up with new screens by itself.
+        AutoFollowCheck.IsChecked = _settings.AutoFollow;
+        if (_settings.AutoFollow) StartWatcher();
         SpeakOnCaptureCheck.IsChecked = _settings.SpeakOnCapture;
 
         _hotkey = new HotkeyManager(this, _settings.Hotkey);
@@ -97,6 +101,7 @@ public partial class MainWindow : Window
     /// </summary>
     public void ShowReaderAtStartup()
     {
+        _userHidden = false;
         EnsureOverlay(new ReadableDocument());
         var hwnd = NativeMethods.GetForegroundWindow();
         if (hwnd != IntPtr.Zero && GetPid(hwnd) != Environment.ProcessId && !IsShellOrDesktop(hwnd))
@@ -155,20 +160,72 @@ public partial class MainWindow : Window
         try
         {
             _watcher ??= new ForegroundWatcher(TimeSpan.FromMilliseconds(350));
+            _watcher.ForegroundChanged -= OnForegroundChanged;
             _watcher.ForegroundChanged += OnForegroundChanged;
         }
         catch
         {
             StatusText.Text = "Foreground watching unavailable.";
         }
+
+        try
+        {
+            _liveWatcher ??= new LiveWatcher(TimeSpan.FromMilliseconds(600));
+            _liveWatcher.ContentChanged -= OnContentChanged;
+            _liveWatcher.ContentChanged += OnContentChanged;
+            _liveWatcher.Track(_lastSourceHwnd);
+        }
+        catch
+        {
+            StatusText.Text = "Content watching unavailable.";
+        }
     }
 
     private void StopWatcher()
     {
-        if (_watcher is null) return;
-        _watcher.ForegroundChanged -= OnForegroundChanged;
-        _watcher.Dispose();
-        _watcher = null;
+        if (_watcher is not null)
+        {
+            _watcher.ForegroundChanged -= OnForegroundChanged;
+            _watcher.Dispose();
+            _watcher = null;
+        }
+        if (_liveWatcher is not null)
+        {
+            _liveWatcher.ContentChanged -= OnContentChanged;
+            _liveWatcher.Dispose();
+            _liveWatcher = null;
+        }
+    }
+
+    /// <summary>
+    /// The window we are showing changed underneath us (new dialog, new page,
+    /// content re-rendered). Re-capture it in place: never steal focus, never
+    /// re-show a reader the user deliberately closed.
+    /// </summary>
+    private void OnContentChanged(IntPtr hwnd)
+    {
+        if (_lastSourceHwnd == IntPtr.Zero) return;
+        if (hwnd != _lastSourceHwnd && !IsChildOf(_lastSourceHwnd, hwnd)) return;
+        if (_overlay is { IsVisible: true, IsEditing: true }) return;
+        if (_captureInFlight) return;
+        // Rate-limit: some apps fire object events continuously (animations,
+        // caret moves); one refresh per second is plenty.
+        if (DateTime.UtcNow - _lastContentCapture < TimeSpan.FromSeconds(1)) return;
+        _lastContentCapture = DateTime.UtcNow;
+
+        DiagnosticsLogger.Log($"Content changed hwnd=0x{hwnd.ToInt64():X} -> refreshing reader");
+        if (_lastSourceIsWeb)
+        {
+            ReadCurrentWebPage(silent: true);
+            return;
+        }
+        CaptureWindow(_lastSourceHwnd, auto: true);
+    }
+
+    private static bool IsChildOf(IntPtr parent, IntPtr hwnd)
+    {
+        try { return NativeMethods.IsChildWindow(parent, hwnd); }
+        catch { return false; }
     }
 
     private void OnForegroundChanged(IntPtr hwnd)
@@ -206,6 +263,7 @@ public partial class MainWindow : Window
         if (_overlay?.IsVisible == true)
         {
             _overlay.Hide();
+            _userHidden = true;
             return;
         }
 
@@ -216,6 +274,8 @@ public partial class MainWindow : Window
             return;
         }
 
+        // Explicit request: the reader may show itself again after a dismissal.
+        _userHidden = false;
         CaptureWindow(hwnd, auto: false);
     }
 
@@ -246,13 +306,41 @@ public partial class MainWindow : Window
         StatusText.Text = "Capturing…";
         DiagnosticsLogger.Log($"CaptureWindow started hwnd=0x{hwnd.ToInt64():X} auto={auto}");
 
-        var sourceLabel = auto ? "Foreground app" : "Foreground app";
+        // Some desktop apps host their entire UI inside an embedded browser child
+        // window. Capture that child instead of the outer shell, and warm up its
+        // lazily-built accessibility tree first (the initial request triggers
+        // generation; the second one actually has content).
+        var target = hwnd;
+        var isEmbeddedBrowser = false;
+        try
+        {
+            var child = NativeMethods.FindWebView2Hwnd(hwnd);
+            if (child != IntPtr.Zero && child != hwnd)
+            {
+                target = child;
+                isEmbeddedBrowser = true;
+            }
+            else
+            {
+                isEmbeddedBrowser = NativeMethods.GetWindowClassName(hwnd)
+                    .StartsWith("Chrome_WidgetWin_", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        catch { /* window vanished; capture the top-level and let it fail normally */ }
+
+        var sourceLabel = "Foreground app";
         Task.Run(() =>
         {
             try
             {
-                var raw = UiaCaptureService.CaptureWindow(hwnd);
-                var title = UiaCaptureService.GetWindowTitle(hwnd);
+                if (isEmbeddedBrowser)
+                {
+                    try { UiaCaptureService.CaptureWindow(target); } catch { }
+                    System.Threading.Thread.Sleep(700);
+                }
+                var raw = UiaCaptureService.CaptureWindow(target);
+                var title = UiaCaptureService.GetWindowTitle(target);
+                if (title.Length == 0) title = UiaCaptureService.GetWindowTitle(hwnd);
                 var doc = DocumentNormalizer.Normalize(raw, title: title, source: sourceLabel);
                 return (Ok: true, Doc: doc, Title: title);
             }
@@ -270,37 +358,88 @@ public partial class MainWindow : Window
                 return;
             }
 
-            _lastDoc = r.Doc;
-            _lastSourceHwnd = hwnd;
-            _lastSourceIsWeb = false;
-            LastSourceText.Text = r.Title;
-            LastSummaryText.Text = $"{r.Doc.Blocks.Count} blocks Â· {r.Doc.PlainText.Length:N0} characters";
+            // Custom-drawn interfaces expose (at best) a nearly empty UIA tree.
+            // Fall back to reading the screen itself so the content is still
+            // usable, with every line clickable.
+            if (IsThinDocument(r.Doc))
+            {
+                DiagnosticsLogger.Log("UIA tree too thin; falling back to screen OCR");
+                CaptureViaOcrFallback(hwnd, auto, r.Title);
+                return;
+            }
 
-            if (_overlay is not null && _overlay.IsVisible)
-            {
-                // Follow the app the user moved to: update silently, don't steal focus.
-                _overlay.UpdateDocument(r.Doc);
-            }
-            else if (auto)
-            {
-                // The overlay runs on its own: first capture opens it without stealing focus.
-                var ov = EnsureOverlay(r.Doc);
-                ov.ShowOverlayNoActivate();
-                if (_settings.SpeakOnCapture)
-                    AnnounceNowShowing(r.Doc);
-            }
-            else
-            {
-                var ov = EnsureOverlay(r.Doc);
-                PositionNear(ov, hwnd);
-                if (_settings.SpeakOnCapture && !string.IsNullOrWhiteSpace(r.Doc.PlainText))
-                {
-                    App.Speech.Speak($"{r.Doc.Title}. {r.Doc.PlainText}");
-                }
-                ov.ShowAndFocusFirst();
-            }
-            StatusText.Text = $"Captured: {r.Title}";
+            ApplyCapturedDoc(r.Doc, hwnd, auto, r.Title);
         }, TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    /// <summary>True when a capture found essentially nothing worth showing.</summary>
+    private static bool IsThinDocument(ReadableDocument doc)
+        => doc.Blocks.Count < 3 || doc.PlainText.Trim().Length < 60;
+
+    /// <summary>
+    /// Last resort for interfaces that do not expose their content through
+    /// accessibility at all: hide the overlay (so it is not in its own picture),
+    /// screenshot the window, OCR it, and present the result. Every OCR line is
+    /// clickable through the existing coordinate-click path.
+    /// </summary>
+    private async void CaptureViaOcrFallback(IntPtr hwnd, bool auto, string title)
+    {
+        var wasVisible = _overlay?.IsVisible == true;
+        if (wasVisible) _overlay!.Hide();
+        await Task.Delay(250); // let the screen repaint without us in the way
+
+        ReadableDocument doc;
+        try
+        {
+            doc = await OcrCaptureService.CaptureAsync(hwnd, 0.70f, gameMode: false);
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Capture failed: {ex.Message}";
+            if (wasVisible) _overlay!.ShowOverlayNoActivate();
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(title) == false)
+            doc.Title = title;
+        ApplyCapturedDoc(doc, hwnd, auto, title, ocrFallback: true);
+    }
+
+    private void ApplyCapturedDoc(ReadableDocument doc, IntPtr hwnd, bool auto, string title, bool ocrFallback = false)
+    {
+        _lastDoc = doc;
+        _lastSourceHwnd = hwnd;
+        _lastSourceIsWeb = false;
+        _liveWatcher?.Track(hwnd);
+        LastSourceText.Text = doc.Title;
+        LastSummaryText.Text = $"{doc.Blocks.Count} blocks · {doc.PlainText.Length:N0} characters";
+
+        if (_overlay is not null && _overlay.IsVisible)
+        {
+            // Follow the app the user moved to: update silently, don't steal focus.
+            _overlay.UpdateDocument(doc);
+        }
+        else if (auto)
+        {
+            if (_userHidden) return; // user dismissed the reader; don't pop back up
+
+            // The overlay runs on its own: first capture opens it without stealing focus.
+            var ov = EnsureOverlay(doc);
+            ov.ShowOverlayNoActivate();
+            if (_settings.SpeakOnCapture)
+                AnnounceNowShowing(doc);
+        }
+        else
+        {
+            var ov = EnsureOverlay(doc);
+            PositionNear(ov, hwnd);
+            if (_settings.SpeakOnCapture && !string.IsNullOrWhiteSpace(doc.PlainText))
+            {
+                App.Speech.Speak($"{doc.Title}. {doc.PlainText}");
+            }
+            ov.ShowAndFocusFirst();
+        }
+        StatusText.Text = ocrFallback ? $"Captured (screen read): {title}" : $"Captured: {title}";
     }
 
     private static void AnnounceNowShowing(ReadableDocument doc)
@@ -320,6 +459,7 @@ public partial class MainWindow : Window
             _overlay.ControlActivated += OnControlActivated;
             _overlay.RefreshRequested += OnRefreshRequested;
             _overlay.ControlPanelRequested += (_, _) => ShowControlPanel();
+            _overlay.HiddenByUser += (_, _) => _userHidden = true;
         }
         else
         {
@@ -404,6 +544,7 @@ public partial class MainWindow : Window
             StatusText.Text = "Nothing captured yet â€” press Ctrl+Alt+A or click Capture.";
             return;
         }
+        _userHidden = false;
         EnsureOverlay(_lastDoc).ShowAndFocusFirst();
     }
 
@@ -569,8 +710,9 @@ public partial class MainWindow : Window
             _lastDoc = doc;
             _lastSourceHwnd = webHwnd;
             _lastSourceIsWeb = true;
+            _liveWatcher?.Track(webHwnd);
             LastSourceText.Text = doc.Title;
-            LastSummaryText.Text = $"{doc.Blocks.Count} blocks Â· {doc.PlainText.Length:N0} characters";
+            LastSummaryText.Text = $"{doc.Blocks.Count} blocks · {doc.PlainText.Length:N0} characters";
 
             if (string.IsNullOrWhiteSpace(doc.PlainText))
             {
@@ -594,7 +736,7 @@ public partial class MainWindow : Window
                 }
                 StatusText.Text = $"Readable view of {doc.Title} ready.";
             }
-            else if (!ov.IsVisible)
+            else if (!ov.IsVisible && !_userHidden)
             {
                 ov.ShowOverlayNoActivate();
             }
