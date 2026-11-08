@@ -18,10 +18,4 @@
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4129.50" />
   </ItemGroup>
 
-  <ItemGroup>
-    <None Include="..\..\libs\nvda\x64\nvdaControllerClient.dll" Link="nvdaControllerClient.dll">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
-
 </Project>

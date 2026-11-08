@@ -1,26 +1,31 @@
 using System.Windows;
 using System.Windows.Automation;
+using System.Windows.Automation.Peers;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
+using System.Windows.Threading;
 using AccessOverlay.App.Native;
 using AccessOverlay.App.Theming;
 using AccessOverlay.Core.AppCapture;
-using AccessOverlay.Core.Audio;
+using AccessOverlay.Core.Diagnostics;
 using AccessOverlay.Core.Model;
-using AccessOverlay.Core.Settings;
-using AccessOverlay.Core.Speech;
 
 namespace AccessOverlay.App.Overlay;
 
 /// <summary>
 /// The always-on-top reader. Shows the normalized, reflowed, genuinely-readable
 /// version of whatever the user is working in. Browse-mode style navigation:
-/// H jumps between headings, Enter reads the current item, and controls
-/// (buttons, links, check boxes, inputs) can be activated straight from here.
+/// H jumps between headings, B/L between controls, and controls (buttons, links,
+/// check boxes, inputs) can be activated straight from here. The app has no speech
+/// of its own: the user's screen reader reads this window through focus changes
+/// and the live status line.
 /// </summary>
 public partial class OverlayWindow : Window
 {
-    private readonly SpeechRouter _speech;
+    private const string RefreshingStatus = "Refreshing reader…";
+    private static readonly TimeSpan UiaTimeout = TimeSpan.FromSeconds(5);
+
     private ReadableDocument _doc;
     private int _themeIndex;
 
@@ -32,16 +37,27 @@ public partial class OverlayWindow : Window
     private ValuePattern? _editValuePattern;
     private string _editOriginal = "";
     private bool _editIsPassword;
+    private bool _editPushed;
+    private int _editProcessId;
     private bool _editSuppressPush;
-    private System.Windows.Threading.DispatcherTimer? _editPushTimer;
+    private DispatcherTimer? _editPushTimer;
+    private Task _editPushTask = Task.CompletedTask;
+    private bool _uiaActionBusy;
+    private Task _editCommitTask = Task.CompletedTask;
 
-    // Auto-read the focused item on selection change, the way a screen reader
-    // follows the caret. Coalesced, and suppressed while we rebuild the list.
-    private System.Windows.Threading.DispatcherTimer? _selectionSpeakTimer;
-    private bool _suppressSelectionSpeak;
+    // The last edit, until the user moves on: Esc on that row puts the old text back.
+    private string? _undoOriginal;
+    private int _undoIndex = -1;
+
+    // Apps whose fields grab the foreground whenever a value is set. Pushing every
+    // keystroke there would send the next keys to the app instead of the editor.
+    private readonly HashSet<int> _focusStealingProcesses = new();
 
     /// <summary>True while the user is typing into a source edit field.</summary>
     public bool IsEditing => EditBar.Visibility == Visibility.Visible;
+
+    /// <summary>True once the user's own window placement has been remembered.</summary>
+    public bool HasSavedPosition => App.Settings.ReaderLeft is not null;
 
     /// <summary>Raised after a control was activated, so the source can be re-captured.</summary>
     public event EventHandler? ControlActivated;
@@ -55,11 +71,10 @@ public partial class OverlayWindow : Window
     /// <summary>Raised when the user deliberately dismisses the reader (Esc / close button).</summary>
     public event EventHandler? HiddenByUser;
 
-    public OverlayWindow(ReadableDocument doc, SpeechRouter speech)
+    public OverlayWindow(ReadableDocument doc)
     {
         InitializeComponent();
         _doc = doc;
-        _speech = speech;
 
         // The reader is an overlay that only ever hides: Escape, the ✕ button
         // and external WM_CLOSE (stray Alt+F4, machine automation) must never
@@ -74,64 +89,170 @@ public partial class OverlayWindow : Window
         _themeIndex = Math.Max(0, Array.IndexOf(ThemeManager.Names, App.Settings.Theme));
         Blocks.FontSize = App.Settings.FontSize;
         Opacity = App.Settings.Opacity;
+        RestoreReaderBounds();
 
         UpdateDocument(doc);
-        SpeechStatusText.Text = $"Reading via {_speech.CurrentOutput}";
+    }
+
+    private void RestoreReaderBounds()
+    {
+        var settings = App.Settings;
+        Width = settings.ReaderWidth ?? 760;
+        Height = settings.ReaderHeight ?? 640;
+        if (settings.ReaderLeft is double left && settings.ReaderTop is double top)
+        {
+            // Ignore a position left over from a monitor that is no longer attached.
+            var screen = new Rect(SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
+                SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
+            if (screen.Contains(new Point(left + 40, top + 20)))
+            {
+                Left = left;
+                Top = top;
+            }
+            else
+            {
+                settings.ReaderLeft = settings.ReaderTop = null;
+            }
+        }
+
+        LocationChanged += (_, _) => RememberBounds();
+        SizeChanged += (_, _) => RememberBounds();
+        IsVisibleChanged += (_, e) =>
+        {
+            if (e.NewValue is not false) return;
+            _undoOriginal = null;
+            App.SettingsStore.Save(App.Settings);
+        };
+    }
+
+    private void RememberBounds()
+    {
+        if (!IsVisible || double.IsNaN(Left) || double.IsNaN(Top)) return;
+        var settings = App.Settings;
+        settings.ReaderLeft = Left;
+        settings.ReaderTop = Top;
+        settings.ReaderWidth = ActualWidth;
+        settings.ReaderHeight = ActualHeight;
+    }
+
+    /// <summary>Shows a message and has the screen reader announce it.</summary>
+    private void SetStatus(string text)
+    {
+        StatusLine.Text = text;
+        var peer = UIElementAutomationPeer.FromElement(StatusLine) ?? UIElementAutomationPeer.CreatePeerForElement(StatusLine);
+        peer?.RaiseAutomationEvent(AutomationEvents.LiveRegionChanged);
+    }
+
+    /// <summary>
+    /// Runs a call into another app off the UI thread, so a hung app can't freeze
+    /// the reader. Returns ok=false, having reported the problem, if it fails.
+    /// </summary>
+    private async Task<(bool Ok, T Value)> RunUiaAsync<T>(Func<T> work, string failureStatus)
+    {
+        try
+        {
+            return (true, await Task.Run(work).WaitAsync(UiaTimeout));
+        }
+        catch (TimeoutException)
+        {
+            SetStatus("That app isn't responding.");
+        }
+        catch (ElementNotAvailableException)
+        {
+            SetStatus("That control changed. Refresh the reader and try again.");
+        }
+        catch
+        {
+            SetStatus(failureStatus);
+        }
+        return (false, default!);
     }
 
     public void UpdateDocument(ReadableDocument doc)
     {
+        TitleText.Text = string.IsNullOrEmpty(doc.Title) ? "Untitled" : doc.Title;
+        if (StatusLine.Text == RefreshingStatus)
+            StatusLine.Text = "";
+
+        // Rebuilding identical rows would make the screen reader re-announce the
+        // focused one on every background refresh. Rows and blocks stay index-aligned,
+        // so only the (possibly recreated) automation handles need replacing.
+        if (Blocks.ItemsSource is not null && HasSameContent(_doc, doc))
+        {
+            _doc = doc;
+            return;
+        }
+
         var previouslySelected = SelectedBlock?.Text;
         var previousIndex = Blocks.SelectedIndex;
+        // Replacing ItemsSource destroys the focused row, which would otherwise
+        // leave the keyboard pointing at nothing until the next click.
+        var hadKeyboardFocus = BlocksHasKeyboardFocus();
         _doc = doc;
-        TitleText.Text = string.IsNullOrEmpty(doc.Title) ? "Untitled" : doc.Title;
 
-        _suppressSelectionSpeak = true;
         Blocks.ItemsSource = doc.Blocks;
 
         // UIA elements are recreated after most actions, so preserve location by
-        // text rather than keeping a stale underlying automation handle.
-        var restoredIndex = previouslySelected is null
-            ? -1
-            : doc.Blocks.ToList().FindIndex(block => block.Text == previouslySelected);
-        if (restoredIndex < 0 && previousIndex >= 0 && previousIndex < doc.Blocks.Count)
+        // text rather than keeping a stale underlying automation handle. Identical
+        // rows are common, so take the match closest to where the cursor was.
+        var restoredIndex = FindNearestBlock(doc.Blocks, previouslySelected, previousIndex);
+        if (restoredIndex < 0 && previousIndex >= 0 && doc.Blocks.Count > 0)
         {
             // The selected text changed (e.g. after a value edit); keep the cursor
             // in place rather than dropping it to nothing.
-            restoredIndex = previousIndex;
+            restoredIndex = Math.Min(previousIndex, doc.Blocks.Count - 1);
         }
         if (restoredIndex >= 0)
             Blocks.SelectedIndex = restoredIndex;
-        _suppressSelectionSpeak = false;
 
+        if (hadKeyboardFocus && !IsEditing)
+            FocusSelectedItem();
+
+        // A background refresh must not move the cursor.
         if (SearchPanel.Visibility == Visibility.Visible)
-            PerformSearch(SearchBox.Text);
+            PerformSearch(SearchBox.Text, jumpToFirst: false);
     }
 
-    private void Blocks_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private static bool HasSameContent(ReadableDocument a, ReadableDocument b)
     {
-        if (_suppressSelectionSpeak || !IsVisible) return;
-
-        // Coalesce fast arrow-key navigation into a single read of the final item.
-        _selectionSpeakTimer ??= new System.Windows.Threading.DispatcherTimer
+        if (a.Blocks.Count != b.Blocks.Count) return false;
+        for (var i = 0; i < a.Blocks.Count; i++)
         {
-            Interval = TimeSpan.FromMilliseconds(150),
-        };
-        _selectionSpeakTimer.Stop();
-        _selectionSpeakTimer.Tick -= SelectionSpeakTimer_Tick;
-        _selectionSpeakTimer.Tick += SelectionSpeakTimer_Tick;
-        _selectionSpeakTimer.Start();
+            if (a.Blocks[i].Text != b.Blocks[i].Text || a.Blocks[i].GetType() != b.Blocks[i].GetType())
+                return false;
+        }
+        return true;
     }
 
-    private void SelectionSpeakTimer_Tick(object? sender, EventArgs e)
+    private static int FindNearestBlock(IReadOnlyList<ContentBlock> blocks, string? text, int around)
     {
-        _selectionSpeakTimer?.Stop();
-        if (!IsVisible || IsEditing) return;
-        // No spatial cue while merely navigating; the cue is reserved for deliberate reads.
-        SpeakSelected(audibleCue: false);
+        if (text is null) return -1;
+        var best = -1;
+        for (var i = 0; i < blocks.Count; i++)
+        {
+            if (blocks[i].Text != text) continue;
+            if (best < 0 || Math.Abs(i - around) < Math.Abs(best - around)) best = i;
+        }
+        return best;
     }
 
-    private void Search_Click(object sender, RoutedEventArgs e) => ToggleSearch();
+    /// <summary>
+    /// Moves keyboard focus onto the selected row. Focusing only the list leaves
+    /// arrow keys starting from whichever row last had focus.
+    /// </summary>
+    private void FocusSelectedItem()
+    {
+        var index = Blocks.SelectedIndex;
+        if (index >= 0 && index < Blocks.Items.Count)
+        {
+            Blocks.ScrollIntoView(Blocks.Items[index]);
+            Blocks.UpdateLayout();
+            if (Blocks.ItemContainerGenerator.ContainerFromIndex(index) is ListBoxItem item && item.Focus())
+                return;
+        }
+        Blocks.Focus();
+    }
+
     private void SearchClose_Click(object sender, RoutedEventArgs e) => CloseSearch();
     private void SearchNext_Click(object sender, RoutedEventArgs e) => JumpToSearchMatch(+1);
     private void SearchPrev_Click(object sender, RoutedEventArgs e) => JumpToSearchMatch(-1);
@@ -157,7 +278,7 @@ public partial class OverlayWindow : Window
         _searchResults.Clear();
         _searchResultIndex = -1;
         MatchCountText.Text = "0 matches";
-        Blocks.Focus();
+        FocusSelectedItem();
     }
 
     private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -179,7 +300,7 @@ public partial class OverlayWindow : Window
         }
     }
 
-    private void PerformSearch(string query)
+    private void PerformSearch(string query, bool jumpToFirst = true)
     {
         _searchResults.Clear();
         _searchResultIndex = -1;
@@ -190,20 +311,21 @@ public partial class OverlayWindow : Window
             return;
         }
 
-        var blocksList = _doc.Blocks.ToList();
-        for (int i = 0; i < blocksList.Count; i++)
+        for (int i = 0; i < _doc.Blocks.Count; i++)
         {
-            if (blocksList[i].Text.Contains(query, StringComparison.OrdinalIgnoreCase))
-            {
+            if (_doc.Blocks[i].Text.Contains(query, StringComparison.OrdinalIgnoreCase))
                 _searchResults.Add(i);
-            }
         }
 
         MatchCountText.Text = $"{_searchResults.Count} match{(_searchResults.Count == 1 ? "" : "es")}";
         if (_searchResults.Count > 0)
         {
             _searchResultIndex = 0;
-            JumpToSearchMatch(0);
+            if (jumpToFirst) JumpToSearchMatch(0);
+        }
+        else if (jumpToFirst)
+        {
+            SetStatus("No matches.");
         }
     }
 
@@ -218,7 +340,8 @@ public partial class OverlayWindow : Window
         MatchCountText.Text = $"{_searchResultIndex + 1} of {_searchResults.Count} matches";
         Blocks.SelectedIndex = blockIndex;
         ScrollToIndex(blockIndex);
-        SpeakSelected();
+        // Focus stays in the search box, so the screen reader needs telling.
+        SetStatus($"{_searchResultIndex + 1} of {_searchResults.Count}: {_doc.Blocks[blockIndex].Text}");
     }
 
     /// <summary>Automation hook: selects a row and activates it, exactly like Enter/double-click would.</summary>
@@ -227,33 +350,38 @@ public partial class OverlayWindow : Window
         if (index < 0 || index >= Blocks.Items.Count) return;
         Blocks.SelectedIndex = index;
         ScrollToIndex(index);
-        ActivateSelected();
+        _ = ActivateSelectedAsync();
     }
 
     public void ShowAndFocusFirst()
     {
-        var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
-        AccessOverlay.App.Native.NativeMethods.AllowActivate(hwnd);
+        ShowActivated = true;
         Show();
         Activate();
-        Blocks.Focus();
         if (Blocks.Items.Count > 0)
-        {
-            // The caller already announces the document on open; don't also read
-            // the first row on top of that.
-            _suppressSelectionSpeak = true;
             Blocks.SelectedIndex = 0;
-            _suppressSelectionSpeak = false;
-            ScrollToIndex(0);
-        }
+        FocusSelectedItem();
     }
 
-    /// <summary>Shows the reader without stealing keyboard focus from the page/app behind it.</summary>
+    /// <summary>Moves the keyboard into a reader that is already showing, keeping the user's place.</summary>
+    public void FocusReader()
+    {
+        ReclaimForeground();
+        Activate();
+        if (Blocks.SelectedIndex < 0 && Blocks.Items.Count > 0)
+            Blocks.SelectedIndex = 0;
+        FocusSelectedItem();
+    }
+
+    /// <summary>
+    /// Shows the reader without stealing keyboard focus from the page/app behind it.
+    /// The window stays activatable: a permanent no-activate style would leave it
+    /// unable to ever receive typing.
+    /// </summary>
     public void ShowOverlayNoActivate()
     {
         if (IsVisible) return;
-        var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
-        AccessOverlay.App.Native.NativeMethods.ShowNoActivate(hwnd);
+        ShowActivated = false;
         Show();
     }
 
@@ -281,158 +409,84 @@ public partial class OverlayWindow : Window
         App.SettingsStore.Save(App.Settings);
     }
 
-    private void Refresh_Click(object sender, RoutedEventArgs e) => RequestRefresh();
-
-    private void Speak_Click(object sender, RoutedEventArgs e) => SpeakSelected();
-
-    private void Edit_Click(object sender, RoutedEventArgs e) => EditSelected();
-
-    private void Activate_Click(object sender, RoutedEventArgs e) => ActivateSelected();
-
-    private void Copy_Click(object sender, RoutedEventArgs e)
+    private void CopyDocument()
     {
         try
         {
             Clipboard.SetText(_doc.PlainText);
+            SetStatus("Copied.");
         }
         catch
         {
-            // Clipboard can be briefly locked by other processes; ignore.
-        }
-    }
-
-    private void Close_Click(object sender, RoutedEventArgs e)
-    {
-        HiddenByUser?.Invoke(this, EventArgs.Empty);
-        Hide();
-    }
-
-    /// <summary>
-    /// WPF only activates a focused button with Space, never Enter. Screen-reader
-    /// users press Enter, so route Enter on a focused button to its Click.
-    /// </summary>
-    private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
-    {
-        bool shiftPressed = e.KeyboardDevice.Modifiers.HasFlag(ModifierKeys.Shift);
-        bool ctrlPressed = e.KeyboardDevice.Modifiers.HasFlag(ModifierKeys.Control);
-        bool altPressed = e.KeyboardDevice.Modifiers.HasFlag(ModifierKeys.Alt);
-
-        if (e.Key == Key.Enter && Keyboard.FocusedElement is Button btn)
-        {
-            e.Handled = true;
-            btn.RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
-            return;
-        }
-
-        if (e.Key == Key.Back && !ctrlPressed && !altPressed && !shiftPressed && BlocksHasKeyboardFocus() && CanEditSelected() && !IsEditing)
-        {
-            e.Handled = true;
-            // Start live typing - user wants to backspace into a field.
-            EditSelected("");
-            return;
-        }
-
-        if (e.Key == Key.Tab)
-        {
-            // Let focus move normally.
-            return;
-        }
-
-        // Character keys: if a writable field is selected and not already editing,
-        // open the inline editor seeded with the pressed character.
-        if (!e.IsRepeat && BlocksHasKeyboardFocus() && CanEditSelected() && !IsEditing && !ctrlPressed && !altPressed)
-        {
-            var key = e.Key;
-            if (key >= Key.A && key <= Key.Z)
-            {
-                e.Handled = true;
-                EditSelected(key.ToString().ToLowerInvariant());
-                return;
-            }
-            if (key >= Key.D0 && key <= Key.D9)
-            {
-                e.Handled = true;
-                EditSelected(((char)('0' + (key - Key.D0))).ToString());
-                return;
-            }
-            if (key >= Key.NumPad0 && key <= Key.NumPad9)
-            {
-                e.Handled = true;
-                EditSelected(((char)('0' + (key - Key.NumPad0))).ToString());
-                return;
-            }
-            // Space
-            if (key == Key.Space)
-            {
-                e.Handled = true;
-                EditSelected(" ");
-                return;
-            }
-            // Common punctuation
-            if (key == Key.OemPeriod)
-            {
-                e.Handled = true;
-                EditSelected(".");
-                return;
-            }
-            if (key == Key.OemComma)
-            {
-                e.Handled = true;
-                EditSelected(",");
-                return;
-            }
-            if (key == Key.OemSemicolon)
-            {
-                e.Handled = true;
-                EditSelected(";");
-                return;
-            }
-            if (key == Key.OemQuotes)
-            {
-                e.Handled = true;
-                EditSelected("\"");
-                return;
-            }
-            if (key == Key.OemQuestion)
-            {
-                e.Handled = true;
-                EditSelected("?");
-                return;
-            }
-            if (key == Key.OemMinus)
-            {
-                e.Handled = true;
-                EditSelected("-");
-                return;
-            }
-            if (key == Key.OemPlus)
-            {
-                e.Handled = true;
-                EditSelected("=");
-                return;
-            }
-            if (key == Key.Divide)
-            {
-                e.Handled = true;
-                EditSelected("/");
-                return;
-            }
+            SetStatus("Clipboard busy, try again.");
         }
     }
 
     private void Controls_Click(object sender, RoutedEventArgs e) => ControlPanelRequested?.Invoke(this, EventArgs.Empty);
 
-    private void Blocks_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    private async void Blocks_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
         e.Handled = true;
-        if (!ActivateSelected()) SpeakSelected();
+        await ActivateSelectedAsync();
     }
 
-    private void Blocks_PreviewKeyDown(object sender, KeyEventArgs e)
+    /// <summary>
+    /// Reader shortcuts live at window level so they keep working after a toolbar
+    /// button has taken focus. Inside a text box, keys belong to the text.
+    /// </summary>
+    private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        // WPF only activates a focused button with Space, never Enter. Screen-reader
+        // users press Enter, so route Enter on a focused button to its Click.
+        if (e.Key == Key.Enter && Keyboard.FocusedElement is Button btn)
+        {
+            e.Handled = true;
+            btn.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            return;
+        }
+
+        if (e.Key == Key.F7)
+        {
+            e.Handled = true;
+            DiagnosticsLogger.Enabled = !DiagnosticsLogger.Enabled;
+            SetStatus(DiagnosticsLogger.Enabled ? "Debug logging on." : "Debug logging off.");
+            return;
+        }
+
+        var ctrlPressed = e.KeyboardDevice.Modifiers.HasFlag(ModifierKeys.Control);
+        var inTextBox = Keyboard.FocusedElement is TextBoxBase or PasswordBox;
+        if (inTextBox && !(e.Key is Key.F3 or Key.F5 || (ctrlPressed && e.Key == Key.F)))
+            return;
+
+        HandleReaderKey(e);
+    }
+
+    private void HandleEscape()
+    {
+        if (SearchPanel.Visibility == Visibility.Visible)
+            CloseSearch();
+        else if (IsEditing)
+            CancelEdit();
+        else if (_undoOriginal is not null && Blocks.SelectedIndex == _undoIndex)
+            _ = UndoLastEditAsync();
+        else
+        {
+            HiddenByUser?.Invoke(this, EventArgs.Empty);
+            Hide();
+        }
+    }
+
+    private void HandleReaderKey(KeyEventArgs e)
     {
         bool shiftPressed = e.KeyboardDevice.Modifiers.HasFlag(ModifierKeys.Shift);
         bool ctrlPressed = e.KeyboardDevice.Modifiers.HasFlag(ModifierKeys.Control);
         bool altPressed = e.KeyboardDevice.Modifiers.HasFlag(ModifierKeys.Alt);
+        bool onButton = Keyboard.FocusedElement is ButtonBase;
+
+        // Doing anything else means the user has moved on from the last edit.
+        if (e.Key is not (Key.Escape or Key.LeftCtrl or Key.RightCtrl or Key.LeftShift or Key.RightShift
+            or Key.LeftAlt or Key.RightAlt or Key.LWin or Key.RWin or Key.System or Key.Insert or Key.CapsLock))
+            _undoOriginal = null;
 
         if (ctrlPressed && e.Key == Key.F)
         {
@@ -441,90 +495,41 @@ public partial class OverlayWindow : Window
             return;
         }
 
-        if (e.Key == Key.F3)
-        {
-            e.Handled = true;
-            JumpToSearchMatch(shiftPressed ? -1 : +1);
-            return;
-        }
-
-        if (ctrlPressed && shiftPressed && e.Key == Key.Up)
-        {
-            e.Handled = true;
-            _speech.Rate = Math.Min(10, _speech.Rate + 1);
-            SpeechStatusText.Text = $"Speech rate: {_speech.Rate}";
-            return;
-        }
-
-        if (ctrlPressed && shiftPressed && e.Key == Key.Down)
-        {
-            e.Handled = true;
-            _speech.Rate = Math.Max(-10, _speech.Rate - 1);
-            SpeechStatusText.Text = $"Speech rate: {_speech.Rate}";
-            return;
-        }
-
         switch (e.Key)
         {
+            case Key.F3:
+                e.Handled = true;
+                JumpToSearchMatch(shiftPressed ? -1 : +1);
+                break;
             case Key.H when !ctrlPressed && !altPressed:
                 e.Handled = true;
                 JumpToHeading(shiftPressed ? -1 : +1);
                 break;
-            case Key.B when !ctrlPressed && !altPressed:
-                e.Handled = true;
-                JumpToControlBlock(shiftPressed ? -1 : +1);
-                break;
-            case Key.L when !ctrlPressed && !altPressed:
+            case Key.B or Key.L when !ctrlPressed && !altPressed:
                 e.Handled = true;
                 JumpToControlBlock(shiftPressed ? -1 : +1);
                 break;
             case Key.Enter:
                 e.Handled = true;
-                if (ActivateSelected()) SpeakSelected();
+                _ = ActivateSelectedAsync();
                 break;
-            case Key.Space when !ctrlPressed && !altPressed:
-                // Space presses the focused control, the way it does everywhere else.
-                if (CanEditSelected())
-                {
-                    // Editable field: let the window-level handler open the editor.
-                    break;
-                }
-                if (ActivateSelected())
-                {
-                    e.Handled = true;
-                    SpeakSelected();
-                }
+            case Key.Space when !ctrlPressed && !altPressed && !onButton:
+                e.Handled = true;
+                _ = ActivateSelectedAsync();
                 break;
             case Key.R when ctrlPressed:
-                e.Handled = true;
-                RequestRefresh();
-                break;
             case Key.F5:
                 e.Handled = true;
                 RequestRefresh();
                 break;
             case Key.E when !ctrlPressed && !altPressed:
+            case Key.F2:
                 e.Handled = true;
-                if (IsEditing)
-                    CommitEdit();
-                else
-                    EditSelected();
-                break;
-            case Key.S when !ctrlPressed && !altPressed:
-                e.Handled = true;
-                SpeakAll();
+                _ = EditSelectedAsync();
                 break;
             case Key.Escape:
                 e.Handled = true;
-                if (SearchPanel.Visibility == Visibility.Visible)
-                    CloseSearch();
-                else if (IsEditing)
-                    CancelEdit();
-                else
-                {
-                    HiddenByUser?.Invoke(this, EventArgs.Empty);
-                    Hide();
-                }
+                HandleEscape();
                 break;
             case Key.OemPlus when ctrlPressed:
                 e.Handled = true;
@@ -536,13 +541,13 @@ public partial class OverlayWindow : Window
                 break;
             case Key.C when ctrlPressed:
                 e.Handled = true;
-                Copy_Click(sender, e);
+                CopyDocument();
                 break;
-            case Key.Left when !ctrlPressed && !altPressed && !shiftPressed:
-                if (AdjustSelectedValue(-1)) e.Handled = true;
+            case Key.Left when !ctrlPressed && !altPressed && !shiftPressed && !onButton:
+                if (TryAdjustSelectedValue(-1)) e.Handled = true;
                 break;
-            case Key.Right when !ctrlPressed && !altPressed && !shiftPressed:
-                if (AdjustSelectedValue(+1)) e.Handled = true;
+            case Key.Right when !ctrlPressed && !altPressed && !shiftPressed && !onButton:
+                if (TryAdjustSelectedValue(+1)) e.Handled = true;
                 break;
         }
     }
@@ -559,7 +564,7 @@ public partial class OverlayWindow : Window
             {
                 Blocks.SelectedIndex = idx;
                 ScrollToIndex(idx);
-                SpeakSelected();
+                FocusSelectedItem();
                 return;
             }
         }
@@ -568,76 +573,57 @@ public partial class OverlayWindow : Window
     private void RequestRefresh()
     {
         RefreshRequested?.Invoke(this, EventArgs.Empty);
-        SpeechStatusText.Text = "Refreshing reader…";
+        StatusLine.Text = RefreshingStatus;
+    }
+
+    private sealed record EditInfo(AutomationElement Target, ValuePattern? ValuePattern, bool IsPassword, string Current, int ProcessId, bool IsMultiline);
+
+    private static EditInfo? ReadEditInfo(AutomationElement root)
+    {
+        var target = FindEditable(root);
+        if (target is null) return null;
+        // Rich text fields often have no ValuePattern; those are typed for real on commit.
+        var valuePattern = target.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern) ? (ValuePattern)pattern : null;
+        var isPassword = target.Current.IsPassword;
+        var current = isPassword ? "" : ReadFieldText(target, valuePattern);
+        var isMultiline = target.Current.ControlType == ControlType.Document || current.Contains('\n') || current.Contains('\r');
+        return new EditInfo(target, valuePattern, isPassword, current, target.Current.ProcessId, isMultiline);
     }
 
     /// <summary>
-    /// Opens the inline input bar for the selected field. Typing then flows straight
-    /// through to the real control in the app or page underneath, keystroke by keystroke.
+    /// Opens the inline input bar for the selected field, holding its current value.
+    /// Typing then flows through to the real control in the app or page underneath.
     /// </summary>
-    private bool EditSelected(string? seedText = null)
+    private async Task EditSelectedAsync()
     {
+        if (IsEditing) return;
         var block = SelectedBlock;
         if (block?.RuntimeTarget is not AutomationElement root)
         {
-            SpeechStatusText.Text = "Select an editable field first.";
-            return false;
+            SetStatus("Select an editable field first.");
+            return;
         }
 
-        var target = FindEditable(root);
-        if (target is null)
+        var (ok, info) = await RunUiaAsync(() => ReadEditInfo(root), "That field could not be opened.");
+        if (!ok || IsEditing) return;
+        if (info is null)
         {
-            SpeechStatusText.Text = "The selected item cannot be edited.";
-            return false;
+            SetStatus("The selected item cannot be edited.");
+            return;
         }
-
-        try
-        {
-            var valuePattern = target.GetCurrentPattern(ValuePattern.Pattern) as ValuePattern;
-            if (valuePattern is null)
-            {
-                SpeechStatusText.Text = "The selected item cannot be edited.";
-                return false;
-            }
-            if (valuePattern.Current.IsReadOnly)
-            {
-                SpeechStatusText.Text = "That field is read-only.";
-                return false;
-            }
-
-            var isPassword = target.Current.IsPassword;
-            BeginEdit(target, valuePattern, block.Text, isPassword ? "" : valuePattern.Current.Value, isPassword, seedText);
-            return true;
-        }
-        catch (ElementNotAvailableException)
-        {
-            SpeechStatusText.Text = "That field changed. Refresh the reader and try again.";
-            return false;
-        }
-        catch
-        {
-            SpeechStatusText.Text = "The source app did not accept the new value.";
-            return false;
-        }
+        BeginEdit(info, block.Text);
     }
 
-    /// <summary>True when the currently selected row is a writable edit field.</summary>
-    private bool CanEditSelected()
+    private static string ReadFieldText(AutomationElement target, ValuePattern? valuePattern)
     {
-        if (SelectedBlock?.RuntimeTarget is not AutomationElement root) return false;
-        var target = FindEditable(root);
-        if (target is null) return false;
-        try
-        {
-            return target.GetCurrentPattern(ValuePattern.Pattern) is ValuePattern vp && !vp.Current.IsReadOnly;
-        }
-        catch { return false; }
+        if (valuePattern is not null) return valuePattern.Current.Value ?? "";
+        if (target.TryGetCurrentPattern(TextPattern.Pattern, out var text))
+            return ((TextPattern)text).DocumentRange.GetText(-1) ?? "";
+        return "";
     }
 
     /// <summary>
     /// True when keyboard focus is on the block list itself or one of its rows.
-    /// Guards the auto-typing shortcut so it cannot steal keys meant for the
-    /// search box or the inline edit bar.
     /// </summary>
     private bool BlocksHasKeyboardFocus()
     {
@@ -647,47 +633,68 @@ public partial class OverlayWindow : Window
         return false;
     }
 
-    private void BeginEdit(AutomationElement target, ValuePattern valuePattern, string label, string currentValue, bool isPassword, string? seedText)
+    private void BeginEdit(EditInfo info, string label)
     {
-        _editTarget = target;
-        _editValuePattern = valuePattern;
-        _editOriginal = currentValue;
-        _editIsPassword = isPassword;
-
-        var seed = seedText ?? "";
-        // Match how typing behaves in a focused field: a typed character replaces
-        // the existing value, while Backspace drops the last character. (Press E to
-        // edit the current value in place instead.)
-        var initial = seedText is null
-            ? currentValue
-            : seed.Length > 0
-                ? seed
-                : currentValue.Length > 0 ? currentValue[..^1] : "";
+        _editTarget = info.Target;
+        _editValuePattern = info.ValuePattern;
+        _editOriginal = info.Current;
+        _editIsPassword = info.IsPassword;
+        _editProcessId = info.ProcessId;
+        _editPushed = false;
+        _editPushTask = Task.CompletedTask;
 
         _editSuppressPush = true;
         EditLabelText.Text = label;
-        if (isPassword)
+        // Must come before focusing: WPF refuses focus inside a collapsed parent.
+        EditBar.Visibility = Visibility.Visible;
+        EditPasswordBox.Visibility = info.IsPassword ? Visibility.Visible : Visibility.Collapsed;
+        EditBox.Visibility = info.IsPassword ? Visibility.Collapsed : Visibility.Visible;
+        if (info.IsPassword)
         {
-            EditPasswordBox.Password = initial;
-            EditPasswordBox.Visibility = Visibility.Visible;
-            EditBox.Visibility = Visibility.Collapsed;
-            EditPasswordBox.Focus();
+            EditPasswordBox.Password = "";
         }
         else
         {
-            EditBox.Text = initial;
-            EditBox.Visibility = Visibility.Visible;
-            EditPasswordBox.Visibility = Visibility.Collapsed;
-            EditBox.Focus();
+            EditBox.AcceptsReturn = info.IsMultiline;
+            EditBox.Text = info.Current;
             EditBox.CaretIndex = EditBox.Text.Length;
         }
         _editSuppressPush = false;
 
-        EditBar.Visibility = Visibility.Visible;
-        SpeechStatusText.Text = "Typing into the field\u2026 Enter to finish, Esc to cancel.";
+        FocusEditor();
+        // A double-click's mouse-up can pull focus back to the row; claim it again after.
+        Dispatcher.BeginInvoke(DispatcherPriority.Input, FocusEditor);
 
-        if (initial != currentValue)
-            QueueEditPush();
+        var finish = info.IsMultiline ? "Enter to finish, Shift+Enter for a new line" : "Enter to finish";
+        SetStatus(CanPushLive
+            ? $"Typing into the field… {finish}, Esc to cancel."
+            : $"Type the text. {finish}, Esc to cancel.");
+    }
+
+    private void FocusEditor()
+    {
+        if (!IsEditing) return;
+        Control box = _editIsPassword ? EditPasswordBox : EditBox;
+        if (box.IsKeyboardFocused) return;
+        if (!IsActive) Activate();
+        UpdateLayout();
+        box.Focus();
+        Keyboard.Focus(box);
+    }
+
+    /// <summary>
+    /// Passwords are sent once on commit: their old value is unreadable, so a live
+    /// push could not be undone by Cancel.
+    /// </summary>
+    private bool CanPushLive => _editValuePattern is not null && !_editIsPassword && !_focusStealingProcesses.Contains(_editProcessId);
+
+    /// <summary>Takes the foreground back if the source app grabbed it. Returns true when it had to.</summary>
+    private bool ReclaimForeground()
+    {
+        var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero || NativeMethods.GetForegroundWindow() == hwnd) return false;
+        NativeMethods.ForceForeground(hwnd);
+        return true;
     }
 
     private void EditBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -696,15 +703,11 @@ public partial class OverlayWindow : Window
         QueueEditPush();
     }
 
-    private void EditPasswordBox_PasswordChanged(object sender, RoutedEventArgs e)
+    private void EditBox_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (_editSuppressPush) return;
-        QueueEditPush();
-    }
-
-    private void EditBox_KeyDown(object sender, KeyEventArgs e)
-    {
-        if (e.Key == Key.Enter)
+        var shiftPressed = e.KeyboardDevice.Modifiers.HasFlag(ModifierKeys.Shift);
+        // Tab leaves the field keeping the text, back on its row, where Esc undoes it.
+        if (e.Key == Key.Tab || (e.Key == Key.Enter && !(shiftPressed && EditBox.AcceptsReturn)))
         {
             e.Handled = true;
             CommitEdit();
@@ -723,62 +726,190 @@ public partial class OverlayWindow : Window
     /// <summary>Batches rapid keystrokes into one push, so the source keeps up while typing.</summary>
     private void QueueEditPush()
     {
-        _editPushTimer ??= new System.Windows.Threading.DispatcherTimer
+        if (!CanPushLive) return;
+        if (_editPushTimer is null)
         {
-            Interval = TimeSpan.FromMilliseconds(60),
-        };
+            _editPushTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(60) };
+            _editPushTimer.Tick += EditPushTimer_Tick;
+        }
         _editPushTimer.Stop();
-        _editPushTimer.Tick -= EditPushTimer_Tick;
-        _editPushTimer.Tick += EditPushTimer_Tick;
         _editPushTimer.Start();
     }
 
     private void EditPushTimer_Tick(object? sender, EventArgs e)
     {
         _editPushTimer?.Stop();
-        PushEditValue();
+        // One push at a time, so an older value can never land after a newer one.
+        if (!_editPushTask.IsCompleted)
+        {
+            QueueEditPush();
+            return;
+        }
+        _editPushTask = PushEditValueAsync();
     }
 
-    private void PushEditValue()
+    private async Task PushEditValueAsync()
     {
-        if (_editValuePattern is null || _editTarget is null) return;
-        var text = _editIsPassword ? EditPasswordBox.Password : EditBox.Text;
-        try
+        if (!CanPushLive) return;
+        var valuePattern = _editValuePattern!;
+        var text = EditBox.Text;
+        var (ok, _) = await RunUiaAsync(() =>
         {
-            _editValuePattern.SetValue(text);
-        }
-        catch (ElementNotAvailableException)
+            valuePattern.SetValue(text);
+            return true;
+        }, "Live typing was refused. Press Enter to type it into the field directly.");
+
+        if (!ok || !ReferenceEquals(valuePattern, _editValuePattern)) return;
+        _editPushed = true;
+        if (ReclaimForeground())
         {
-            SpeechStatusText.Text = "That field changed while typing. Refresh and try again.";
-        }
-        catch
-        {
-            SpeechStatusText.Text = "The source app did not accept the new value.";
+            _focusStealingProcesses.Add(_editProcessId);
+            FocusEditor();
+            SetStatus("Keep typing, then press Enter to send it. Esc to cancel.");
         }
     }
 
-    private void CommitEdit()
+    private void CommitEdit() => _editCommitTask = CommitEditAsync();
+
+    private async Task CommitEditAsync()
     {
         _editPushTimer?.Stop();
-        PushEditValue();
-        var changed = (_editIsPassword ? EditPasswordBox.Password : EditBox.Text) != _editOriginal;
+        if (_editTarget is not { } target) return;
+
+        var valuePattern = _editValuePattern;
+        var isPassword = _editIsPassword;
+        var original = _editOriginal;
+        var text = isPassword ? EditPasswordBox.Password : EditBox.Text;
+        var pendingPush = _editPushTask;
+        // A password's old value is unknown, so an empty box means "left alone".
+        var mustSend = text != original || _editPushed || !pendingPush.IsCompleted;
+
         CloseEditBar();
-        SpeechStatusText.Text = changed ? "Field updated." : "No change.";
-        if (changed)
-            AfterActivated();
+        if (!mustSend)
+        {
+            SetStatus("No change.");
+            return;
+        }
+
+        // Recorded before the send so an immediate Esc undoes rather than closing the
+        // reader. A password's old value is unknown, so it can't be put back.
+        if (!isPassword && text != original)
+        {
+            _undoOriginal = original;
+            _undoIndex = Blocks.SelectedIndex;
+        }
+
+        StatusLine.Text = "Sending…";
+        await pendingPush;
+        var (ok, accepted) = await RunUiaAsync(
+            () => TrySetValue(valuePattern, text, original, isPassword),
+            "The source app did not accept the new value.");
+        var delivered = (ok && accepted) || await TypeWithKeyboardAsync(target, text);
+
+        if (!delivered)
+        {
+            _undoOriginal = null;
+            SetStatus("The field did not accept the text.");
+            return;
+        }
+        if (IsVisible && ReclaimForeground())
+            FocusSelectedItem();
+        ControlActivated?.Invoke(this, EventArgs.Empty);
+        SetStatus(_undoOriginal is null ? "Field updated." : "Field updated. Esc to undo.");
     }
 
-    private void CancelEdit()
+    private async Task UndoLastEditAsync()
+    {
+        var original = _undoOriginal!;
+        _undoOriginal = null;
+        await _editCommitTask;
+
+        // The row's element is re-read: a refresh may have replaced the one that was edited.
+        if (SelectedBlock?.RuntimeTarget is not AutomationElement root) return;
+        var (ok, info) = await RunUiaAsync(() => ReadEditInfo(root), "That field could not be restored.");
+        if (!ok) return;
+        if (info is null)
+        {
+            SetStatus("That field could not be restored.");
+            return;
+        }
+
+        var (set, accepted) = await RunUiaAsync(
+            () => TrySetValue(info.ValuePattern, original, info.Current, isPassword: false),
+            "That field could not be restored.");
+        if (!(set && accepted) && !await TypeWithKeyboardAsync(info.Target, original))
+        {
+            SetStatus("That field could not be restored.");
+            return;
+        }
+        if (IsVisible && ReclaimForeground())
+            FocusSelectedItem();
+        ControlActivated?.Invoke(this, EventArgs.Empty);
+        SetStatus("Change undone.");
+    }
+
+    /// <summary>
+    /// Sets the value through UI Automation and confirms it landed: some controls
+    /// report success yet ignore the call. Chromium applies it asynchronously, hence the wait.
+    /// </summary>
+    private static bool TrySetValue(ValuePattern? valuePattern, string text, string original, bool isPassword)
+    {
+        if (valuePattern is null) return false;
+        valuePattern.SetValue(text);
+        if (isPassword || text == original) return true;
+        Thread.Sleep(150);
+        return valuePattern.Current.Value != original;
+    }
+
+    /// <summary>
+    /// Fallback for fields that refuse programmatic values: focus the real field and
+    /// type into it. Keys are only sent once that field verifiably has focus, so text
+    /// (possibly a password) can never land in some other window.
+    /// </summary>
+    private async Task<bool> TypeWithKeyboardAsync(AutomationElement target, string text)
+    {
+        var (ok, typed) = await RunUiaAsync(() =>
+        {
+            target.SetFocus();
+            var focused = false;
+            for (var attempt = 0; attempt < 12 && !focused; attempt++)
+            {
+                Thread.Sleep(50);
+                focused = target.Current.HasKeyboardFocus;
+            }
+            if (!focused) return false;
+
+            NativeMethods.SendSelectAll();
+            Thread.Sleep(30);
+            NativeMethods.SendText(text);
+            Thread.Sleep(80);
+            return true;
+        }, "The field did not accept the text.");
+
+        if (IsVisible) FocusReader();
+        return ok && typed;
+    }
+
+    private async void CancelEdit()
     {
         _editPushTimer?.Stop();
-        try
-        {
-            _editValuePattern?.SetValue(_editOriginal);
-        }
-        catch { /* the field may have gone away; nothing to restore */ }
+        var valuePattern = _editValuePattern;
+        var original = _editOriginal;
+        var pendingPush = _editPushTask;
+        var restore = _editPushed || !pendingPush.IsCompleted;
+
         CloseEditBar();
-        SpeechStatusText.Text = "Edit cancelled.";
-        Blocks.Focus();
+        SetStatus("Edit cancelled.");
+
+        if (!restore || valuePattern is null) return;
+        await pendingPush;
+        await RunUiaAsync(() =>
+        {
+            valuePattern.SetValue(original);
+            return true;
+        }, "The original value could not be restored.");
+        if (IsVisible && ReclaimForeground())
+            FocusSelectedItem();
     }
 
     private void CloseEditBar()
@@ -793,25 +924,42 @@ public partial class OverlayWindow : Window
         _editValuePattern = null;
         _editOriginal = "";
         _editIsPassword = false;
-        Blocks.Focus();
+        _editPushed = false;
+        FocusSelectedItem();
     }
 
     private static AutomationElement? FindEditable(AutomationElement root)
     {
         try
         {
-            if (root.TryGetCurrentPattern(ValuePattern.Pattern, out _))
+            if (IsWritable(root) || UiaCaptureService.IsWritableDocument(root))
                 return root;
             var controls = root.FindAll(TreeScope.Descendants, Automation.ControlViewCondition);
             foreach (AutomationElement candidate in controls)
             {
-                if (candidate.TryGetCurrentPattern(ValuePattern.Pattern, out _))
+                if (IsWritable(candidate))
                     return candidate;
             }
         }
         catch { }
         return null;
     }
+
+    private static bool IsWritable(AutomationElement element)
+    {
+        try
+        {
+            if (!element.Current.IsEnabled) return false;
+            if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
+                return !((ValuePattern)pattern).Current.IsReadOnly;
+            return element.Current.ControlType == ControlType.Edit && element.Current.IsKeyboardFocusable;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private void JumpToHeading(int direction)
     {
         var start = Blocks.SelectedIndex < 0 ? 0 : Blocks.SelectedIndex;
@@ -824,6 +972,7 @@ public partial class OverlayWindow : Window
             {
                 Blocks.SelectedIndex = idx;
                 ScrollToIndex(idx);
+                FocusSelectedItem();
                 return;
             }
         }
@@ -839,81 +988,117 @@ public partial class OverlayWindow : Window
             el.BringIntoView();
     }
 
+    private enum ActivationKind { NotInteractive, Activated, EditField, ClickAt }
+
+    private readonly record struct ActivationResult(ActivationKind Kind, int X = 0, int Y = 0);
+
     /// <summary>
     /// Pushes the button / follows the link / toggles the check box that this row
-    /// represents, on the real page or app underneath. Returns false when the row
-    /// is not interactive (then the caller just speaks it).
+    /// represents, on the real page or app underneath.
     /// </summary>
-    private bool ActivateSelected()
+    private async Task ActivateSelectedAsync()
     {
         var block = SelectedBlock;
-        if (block is null) return false;
+        if (block is null) return;
 
-        // --- Game OCR Mode: activate by sending a real mouse click to screen coordinates ---
+        // Screen-read content: activate by sending a real mouse click to screen coordinates.
         if (block.RuntimeTarget is OcrElementTarget ocrTarget)
         {
-            SpeechStatusText.Text = $"Clicking \u201c{ocrTarget.Text}\u201d in game\u2026";
+            SetStatus($"Clicking “{ocrTarget.Text}”…");
             ClickThroughAt(ocrTarget.ScreenX, ocrTarget.ScreenY);
             AfterActivated();
-            return true;
+            return;
         }
 
-        // --- Standard UIA Mode ---
-        if (block.RuntimeTarget is not AutomationElement el)
-            return false;
+        if (block.RuntimeTarget is not AutomationElement el || _uiaActionBusy) return;
 
-        var target = FindActivatable(el) ?? el;
+        _uiaActionBusy = true;
         try
         {
-            if (target.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
-            {
-                ((InvokePattern)invoke).Invoke();
-                AfterActivated();
-                return true;
-            }
-            if (target.TryGetCurrentPattern(TogglePattern.Pattern, out var toggle))
-            {
-                ((TogglePattern)toggle).Toggle();
-                AfterActivated();
-                return true;
-            }
-            if (target.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var select))
-            {
-                ((SelectionItemPattern)select).Select();
-                AfterActivated();
-                return true;
-            }
-            if (target.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expand))
-            {
-                var xp = (ExpandCollapsePattern)expand;
-                if (xp.Current.ExpandCollapseState == ExpandCollapseState.Collapsed)
-                    xp.Expand();
-                else
-                    xp.Collapse();
-                AfterActivated();
-                return true;
-            }
-            if (target.TryGetCurrentPattern(ValuePattern.Pattern, out _))
-                return EditSelected();
+            var isControl = block is ControlBlock;
+            var (ok, result) = await RunUiaAsync(() => Activate(el, isControl), "Could not activate that control.");
+            if (!ok) return;
 
-            // Last resort: custom-drawn controls (many launchers, embedded
-            // browsers) expose no action pattern at all but do report where they
-            // are on screen. Click them directly.
-            if (TryClickElement(target))
+            switch (result.Kind)
             {
-                AfterActivated();
-                return true;
+                case ActivationKind.EditField:
+                    await EditSelectedAsync();
+                    break;
+                case ActivationKind.ClickAt:
+                    ClickThroughAt(result.X, result.Y);
+                    AfterActivated();
+                    break;
+                case ActivationKind.Activated:
+                    AfterActivated();
+                    break;
             }
-            return false;
         }
-        catch (ElementNotAvailableException)
+        finally
         {
-            SpeechStatusText.Text = "That control changed. Refresh the reader and try again.";
-            return false;
+            _uiaActionBusy = false;
+        }
+    }
+
+    private static ActivationResult Activate(AutomationElement el, bool isControl)
+    {
+        // A field's inner "clear" button must not win over typing into the field.
+        if (IsTextField(el))
+            return new ActivationResult(ActivationKind.EditField);
+
+        var target = FindActivatable(el) ?? el;
+        if (target.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
+        {
+            ((InvokePattern)invoke).Invoke();
+            return new ActivationResult(ActivationKind.Activated);
+        }
+        if (target.TryGetCurrentPattern(TogglePattern.Pattern, out var toggle))
+        {
+            ((TogglePattern)toggle).Toggle();
+            return new ActivationResult(ActivationKind.Activated);
+        }
+        if (target.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var select))
+        {
+            ((SelectionItemPattern)select).Select();
+            return new ActivationResult(ActivationKind.Activated);
+        }
+        if (target.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expand))
+        {
+            var xp = (ExpandCollapsePattern)expand;
+            if (xp.Current.ExpandCollapseState == ExpandCollapseState.Collapsed)
+                xp.Expand();
+            else
+                xp.Collapse();
+            return new ActivationResult(ActivationKind.Activated);
+        }
+        if (target.TryGetCurrentPattern(ValuePattern.Pattern, out _))
+            return new ActivationResult(ActivationKind.EditField);
+
+        // Last resort: custom-drawn controls (many launchers, embedded browsers)
+        // expose no action pattern at all but do report where they are on screen.
+        // Plain text rows have nothing to click.
+        if (isControl)
+        {
+            var rect = target.Current.BoundingRectangle;
+            if (!rect.IsEmpty && rect.Width >= 1 && rect.Height >= 1)
+            {
+                int x = (int)Math.Round(rect.Left + rect.Width / 2);
+                int y = (int)Math.Round(rect.Top + rect.Height / 2);
+                if (x >= 0 && y >= 0)
+                    return new ActivationResult(ActivationKind.ClickAt, x, y);
+            }
+        }
+        return new ActivationResult(ActivationKind.NotInteractive);
+    }
+
+    private static bool IsTextField(AutomationElement element)
+    {
+        try
+        {
+            return UiaCaptureService.IsWritableDocument(element)
+                   || (element.Current.ControlType == ControlType.Edit && IsWritable(element));
         }
         catch
         {
-            SpeechStatusText.Text = "Could not activate that control.";
             return false;
         }
     }
@@ -955,101 +1140,98 @@ public partial class OverlayWindow : Window
 
     /// <summary>
     /// Left / Right arrows on a combo box, spinner or slider step the control's own
-    /// value (the way the control behaves when it has focus in the app), instead of
-    /// just moving the row selection. Returns false when the row has no steppable
-    /// value, so the default list navigation still runs.
+    /// value (the way the control behaves when it has focus in the app). Returns
+    /// false when the row can't have a steppable value, leaving the key alone.
     /// </summary>
-    private bool AdjustSelectedValue(int delta)
+    private bool TryAdjustSelectedValue(int delta)
     {
-        if (IsEditing) return false;
-        var block = SelectedBlock;
-        if (block?.RuntimeTarget is not AutomationElement root) return false;
-
-        var target = FindValueControl(root);
-        if (target is null) return false;
-
-        try
-        {
-            // Sliders and spin buttons expose a numeric range directly.
-            if (target.TryGetCurrentPattern(RangeValuePattern.Pattern, out var rangeObj))
-            {
-                var rv = (RangeValuePattern)rangeObj;
-                var info = rv.Current;
-                if (info.Minimum >= info.Maximum) return false;
-                double step = info.SmallChange > 0 ? info.SmallChange : Math.Max(Math.Abs(info.Maximum - info.Minimum) / 50.0, 1.0);
-                double next = Math.Clamp(info.Value + delta * step, info.Minimum, info.Maximum);
-                if (Math.Abs(next - info.Value) < double.Epsilon) return false;
-                rv.SetValue(next);
-                AnnounceValueChanged(rv.Current.Value.ToString("0.##"));
-                return true;
-            }
-
-            // Combo boxes: step through their option items.
-            var items = GetSelectionItems(target);
-            if (items.Count > 0)
-            {
-                int index = items.FindIndex(it => it.IsSelected);
-                if (index < 0) return false;
-                int nextIndex = Math.Clamp(index + delta, 0, items.Count - 1);
-                if (nextIndex == index) return false;
-                SelectItem(items[nextIndex]);
-                AnnounceValueChanged(items[nextIndex].Name);
-                return true;
-            }
-
-            // Collapsed combo whose options are only in the tree once expanded.
-            if (target.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expandObj))
-            {
-                var xp = (ExpandCollapsePattern)expandObj;
-                if (xp.Current.ExpandCollapseState == ExpandCollapseState.Collapsed)
-                {
-                    xp.Expand();
-                    items = GetSelectionItems(target);
-                    if (items.Count > 0)
-                    {
-                        int index = items.FindIndex(it => it.IsSelected);
-                        int nextIndex = Math.Clamp((index < 0 ? 0 : index) + delta, 0, items.Count - 1);
-                        if (nextIndex != index)
-                            SelectItem(items[nextIndex]);
-                        xp.Collapse();
-                        if (nextIndex != index)
-                            AnnounceValueChanged(items[nextIndex].Name);
-                        return nextIndex != index;
-                    }
-                    xp.Collapse();
-                }
-            }
-
-            // Text-backed numeric value (e.g. an up/down control showing a number).
-            if (target.TryGetCurrentPattern(ValuePattern.Pattern, out var valueObj))
-            {
-                var vp = (ValuePattern)valueObj;
-                if (!vp.Current.IsReadOnly
-                    && double.TryParse(vp.Current.Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var number))
-                {
-                    vp.SetValue((number + delta).ToString(System.Globalization.CultureInfo.InvariantCulture));
-                    AnnounceValueChanged((number + delta).ToString("0.##"));
-                    return true;
-                }
-            }
-        }
-        catch (ElementNotAvailableException)
-        {
-            SpeechStatusText.Text = "That control changed. Refresh the reader and try again.";
-        }
-        catch
-        {
-            SpeechStatusText.Text = "That control did not accept the change.";
-        }
-        return false;
+        if (IsEditing || _uiaActionBusy) return false;
+        if (SelectedBlock is not ControlBlock { RuntimeTarget: AutomationElement root }) return false;
+        _ = AdjustSelectedValueAsync(root, delta);
+        return true;
     }
 
-    private void AnnounceValueChanged(string value)
+    private async Task AdjustSelectedValueAsync(AutomationElement root, int delta)
     {
-        var text = string.IsNullOrWhiteSpace(value) ? "value changed" : value;
-        SpeechStatusText.Text = $"Value: {text}";
-        _speech.Speak(text);
-        RequestRefresh();
+        _uiaActionBusy = true;
+        try
+        {
+            var (ok, value) = await RunUiaAsync(() => StepValue(root, delta), "That control did not accept the change.");
+            if (!ok || value is null) return;
+            SetStatus(string.IsNullOrWhiteSpace(value) ? "Value changed." : $"Value: {value}");
+            RefreshRequested?.Invoke(this, EventArgs.Empty);
+        }
+        finally
+        {
+            _uiaActionBusy = false;
+        }
+    }
+
+    /// <summary>Returns the new value's text, or null when nothing changed.</summary>
+    private static string? StepValue(AutomationElement root, int delta)
+    {
+        var target = FindValueControl(root);
+        if (target is null) return null;
+
+        // Sliders and spin buttons expose a numeric range directly.
+        if (target.TryGetCurrentPattern(RangeValuePattern.Pattern, out var rangeObj))
+        {
+            var rv = (RangeValuePattern)rangeObj;
+            var info = rv.Current;
+            if (info.Minimum >= info.Maximum) return null;
+            double step = info.SmallChange > 0 ? info.SmallChange : Math.Max(Math.Abs(info.Maximum - info.Minimum) / 50.0, 1.0);
+            double next = Math.Clamp(info.Value + delta * step, info.Minimum, info.Maximum);
+            if (Math.Abs(next - info.Value) < double.Epsilon) return null;
+            rv.SetValue(next);
+            return rv.Current.Value.ToString("0.##");
+        }
+
+        // Combo boxes: step through their option items.
+        var items = GetSelectionItems(target);
+        if (items.Count > 0)
+        {
+            int index = items.FindIndex(it => it.IsSelected);
+            if (index < 0) return null;
+            int nextIndex = Math.Clamp(index + delta, 0, items.Count - 1);
+            if (nextIndex == index) return null;
+            SelectItem(items[nextIndex]);
+            return items[nextIndex].Name;
+        }
+
+        // Collapsed combo whose options are only in the tree once expanded.
+        if (target.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expandObj))
+        {
+            var xp = (ExpandCollapsePattern)expandObj;
+            if (xp.Current.ExpandCollapseState == ExpandCollapseState.Collapsed)
+            {
+                xp.Expand();
+                items = GetSelectionItems(target);
+                if (items.Count > 0)
+                {
+                    int index = items.FindIndex(it => it.IsSelected);
+                    int nextIndex = Math.Clamp((index < 0 ? 0 : index) + delta, 0, items.Count - 1);
+                    if (nextIndex != index)
+                        SelectItem(items[nextIndex]);
+                    xp.Collapse();
+                    return nextIndex != index ? items[nextIndex].Name : null;
+                }
+                xp.Collapse();
+            }
+        }
+
+        // Text-backed numeric value (e.g. an up/down control showing a number).
+        // Never a plain text box: an arrow key must not rewrite what's typed there.
+        if (target.Current.ControlType != ControlType.Edit && target.TryGetCurrentPattern(ValuePattern.Pattern, out var valueObj))
+        {
+            var vp = (ValuePattern)valueObj;
+            if (!vp.Current.IsReadOnly
+                && double.TryParse(vp.Current.Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var number))
+            {
+                vp.SetValue((number + delta).ToString(System.Globalization.CultureInfo.InvariantCulture));
+                return (number + delta).ToString("0.##");
+            }
+        }
+        return null;
     }
 
     private static void SelectItem(SelectableItem item)
@@ -1124,26 +1306,7 @@ public partial class OverlayWindow : Window
     private void AfterActivated()
     {
         ControlActivated?.Invoke(this, EventArgs.Empty);
-        SpeechStatusText.Text = "Sent to the page/app…";
-    }
-
-    /// <summary>Clicks the centre of a UI element that exposes no action pattern.</summary>
-    private bool TryClickElement(AutomationElement target)
-    {
-        try
-        {
-            var rect = target.Current.BoundingRectangle;
-            if (rect.IsEmpty || rect.Width < 1 || rect.Height < 1) return false;
-            int x = (int)Math.Round(rect.Left + rect.Width / 2);
-            int y = (int)Math.Round(rect.Top + rect.Height / 2);
-            if (x < 0 || y < 0) return false;
-            ClickThroughAt(x, y);
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
+        StatusLine.Text = "Sent to the page/app…";
     }
 
     /// <summary>
@@ -1158,8 +1321,8 @@ public partial class OverlayWindow : Window
         {
             if (IsVisible)
             {
-                var topLeft = PointToScreen(new Point(0, 0));
-                var bounds = new Rect(topLeft, new Vector(ActualWidth, ActualHeight));
+                // PointToScreen returns device pixels, like the click point; ActualWidth doesn't.
+                var bounds = new Rect(PointToScreen(new Point(0, 0)), PointToScreen(new Point(ActualWidth, ActualHeight)));
                 covered = bounds.Contains(new Point(x, y));
             }
         }
@@ -1177,7 +1340,7 @@ public partial class OverlayWindow : Window
                 Dispatcher.Invoke(() =>
                 {
                     ShowOverlayNoActivate();
-                    if (wasActive) Activate();
+                    if (wasActive) FocusReader();
                 });
             });
         }
@@ -1192,46 +1355,5 @@ public partial class OverlayWindow : Window
     }
 
     private ContentBlock? SelectedBlock =>
-        Blocks.SelectedIndex >= 0 ? Blocks.Items[Blocks.SelectedIndex] as ContentBlock : null;
-
-    private void SpeakSelected(bool audibleCue = true)
-    {
-        var block = SelectedBlock;
-        if (block is null || string.IsNullOrWhiteSpace(block.Text)) return;
-
-        if (audibleCue)
-        {
-            // Play a spatial audio cue based on block type before reading
-            Task.Run(() =>
-            {
-                try
-                {
-                    switch (block)
-                    {
-                        case HeadingBlock:  BeepSynthesizer.PlayHeadingBeep(); break;
-                        case ControlBlock:  BeepSynthesizer.PlayButtonBeep();  break;
-                        default:           BeepSynthesizer.PlayFieldBeep();   break;
-                    }
-                }
-                catch { }
-            });
-        }
-
-        _speech.Speak(block.Text);
-        SpeechStatusText.Text = $"Reading via {_speech.CurrentOutput}";
-    }
-
-    private void SpeakAll()
-    {
-        if (string.IsNullOrWhiteSpace(_doc.PlainText)) return;
-        _speech.Speak(_doc.PlainText);
-        SpeechStatusText.Text = $"Reading via {_speech.CurrentOutput}";
-    }
+        Blocks.SelectedIndex >= 0 && Blocks.SelectedIndex < _doc.Blocks.Count ? _doc.Blocks[Blocks.SelectedIndex] : null;
 }
-
-
-
-
-
-
-

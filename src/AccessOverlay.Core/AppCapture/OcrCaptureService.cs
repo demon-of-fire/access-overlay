@@ -21,7 +21,7 @@ public static class OcrCaptureService
             ?? OcrEngine.TryCreateFromLanguage(new Windows.Globalization.Language("en-US"));
     }
 
-    public static async Task<ReadableDocument> CaptureWindowOcrAsync(IntPtr hwnd, string title = "Game Menu", float minConfidence = 0.70f, bool gameMode = false)
+    public static async Task<ReadableDocument> CaptureWindowOcrAsync(IntPtr hwnd, string title = "Screen")
     {
         try
         {
@@ -54,7 +54,7 @@ public static class OcrCaptureService
                 return new ReadableDocument
                 {
                     Title = title,
-                    Source = "OCR Game Reader",
+                    Source = "Screen read",
                     Blocks = new List<ContentBlock>
                     {
                         new ParagraphBlock { Text = "Windows OCR engine unavailable.", Depth = 0 }
@@ -110,13 +110,13 @@ public static class OcrCaptureService
                     totalHeight
                 );
 
-                    // If line looks like a button / menu option or short text, make it an interactive ControlBlock
-                if (LooksLikeGameMenuOption(lineText, gameMode))
+                // A short line is probably a button or menu option, so make it clickable.
+                if (LooksLikeControl(lineText))
                 {
                     blocks.Add(new ControlBlock
                     {
                         Text = lineText,
-                        Role = gameMode ? "Game Menu Option" : "On-screen control",
+                        Role = "On-screen control",
                         State = "Clickable",
                         Depth = 0,
                         RuntimeTarget = target
@@ -137,15 +137,15 @@ public static class OcrCaptureService
             {
                 blocks.Add(new ParagraphBlock
                 {
-                    Text = "No game text or menu items detected on screen.",
+                    Text = "No text detected on screen.",
                     Depth = 0
                 });
             }
 
             return new ReadableDocument
             {
-                Title = string.IsNullOrWhiteSpace(title) ? "Game Menu OCR" : title,
-                Source = "Game Reader",
+                Title = string.IsNullOrWhiteSpace(title) ? "Screen" : title,
+                Source = "Screen read",
                 Blocks = blocks
             };
         }
@@ -154,7 +154,7 @@ public static class OcrCaptureService
             return new ReadableDocument
             {
                 Title = title,
-                Source = "Game Reader Error",
+                Source = "Screen read error",
                 Blocks = new List<ContentBlock>
                 {
                     new ParagraphBlock { Text = $"OCR scan failed: {ex.Message}", Depth = 0 }
@@ -163,15 +163,10 @@ public static class OcrCaptureService
         }
     }
 
-    /// <summary>
-    /// Public API used by MainWindow. Captures <paramref name="hwnd"/> via OCR.
-    /// <paramref name="minConfidence"/> (0–1) is used to discard low-confidence words
-    /// (useful for Frostbite where texture aliasing produces garbled characters).
-    /// </summary>
-    public static async Task<ReadableDocument> CaptureAsync(IntPtr hwnd, float minConfidence = 0.70f, bool gameMode = false)
+    /// <summary>Reads <paramref name="hwnd"/> from the screen, for apps that expose nothing to accessibility.</summary>
+    public static async Task<ReadableDocument> CaptureAsync(IntPtr hwnd)
     {
-        // Get window title for the overlay header
-        var title = "Game Menu";
+        var title = "Screen";
         try
         {
             var sb = new System.Text.StringBuilder(512);
@@ -181,7 +176,7 @@ public static class OcrCaptureService
         }
         catch { }
 
-        return await CaptureWindowOcrAsync(hwnd, title, minConfidence, gameMode);
+        return await CaptureWindowOcrAsync(hwnd, title);
     }
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -196,7 +191,7 @@ public static class OcrCaptureService
         public int Left, Top, Right, Bottom;
     }
 
-    private static bool LooksLikeGameMenuOption(string text, bool gameMode)
+    private static bool LooksLikeControl(string text)
     {
         if (text.Length > 45) return false;
         if (text.EndsWith(".") || text.EndsWith("?") || text.EndsWith("!")) return false;
@@ -204,25 +199,6 @@ public static class OcrCaptureService
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (words.Length > 6) return false;
 
-        if (text.Any(char.IsDigit)) return true;
-        if (text.StartsWith("Play ", StringComparison.OrdinalIgnoreCase) ||
-            text.StartsWith("Start ", StringComparison.OrdinalIgnoreCase) ||
-            text.StartsWith("Continue ", StringComparison.OrdinalIgnoreCase) ||
-            text.StartsWith("Resume ", StringComparison.OrdinalIgnoreCase) ||
-            text.StartsWith("Exit ", StringComparison.OrdinalIgnoreCase) ||
-            text.StartsWith("Back ", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        if (gameMode)
-        {
-            if (text.ToUpperInvariant() == text && text.Any(char.IsLetter))
-                return true;
-            if (words.Length <= 4 && text.Length >= 3)
-                return true;
-        }
-
-        return words.Length <= 4;
+        return text.Any(char.IsDigit) || words.Length <= 4;
     }
 }

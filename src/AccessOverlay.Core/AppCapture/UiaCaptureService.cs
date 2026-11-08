@@ -34,6 +34,8 @@ public static class UiaCaptureService
         RangeValuePattern.Pattern,
     };
 
+    private const int MaxDocumentChars = 100_000;
+
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 
@@ -97,6 +99,13 @@ public static class UiaCaptureService
         var value = Safe(() => (el.GetCachedPattern(ValuePattern.Pattern) as ValuePattern)?.Cached.Value);
         node.Value = value ?? "";
 
+        if (node.ControlType == "Document" && !node.IsOffscreen && IsWritableDocument(el))
+        {
+            node.IsWritableDocument = true;
+            if (node.Value.Length == 0)
+                node.Value = ReadDocumentText(el);
+        }
+
         var toggle = Safe(() => (el.GetCachedPattern(TogglePattern.Pattern) as TogglePattern)?.Cached.ToggleState.ToString());
         node.ToggleState = toggle ?? "";
 
@@ -126,6 +135,41 @@ public static class UiaCaptureService
         }
 
         return node;
+    }
+
+    /// <summary>
+    /// True for a document the user can type into (Notepad, Word, rich editors).
+    /// A web page is also a Document, but reports itself read-only.
+    /// </summary>
+    public static bool IsWritableDocument(AutomationElement el)
+    {
+        try
+        {
+            if (el.Current.ControlType != ControlType.Document || !el.Current.IsEnabled || !el.Current.IsKeyboardFocusable)
+                return false;
+            if (el.TryGetCurrentPattern(ValuePattern.Pattern, out var value))
+                return !((ValuePattern)value).Current.IsReadOnly;
+            return el.TryGetCurrentPattern(TextPattern.Pattern, out var text)
+                   && ((TextPattern)text).DocumentRange.GetAttributeValue(TextPattern.IsReadOnlyAttribute) is false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string ReadDocumentText(AutomationElement el)
+    {
+        try
+        {
+            return el.TryGetCurrentPattern(TextPattern.Pattern, out var text)
+                ? ((TextPattern)text).DocumentRange.GetText(MaxDocumentChars) ?? ""
+                : "";
+        }
+        catch
+        {
+            return "";
+        }
     }
 
     private static T Safe<T>(Func<T> getter)

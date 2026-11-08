@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -13,7 +12,6 @@ using AccessOverlay.Core.Diagnostics;
 using AccessOverlay.Core.Model;
 using AccessOverlay.Core.Normalization;
 using AccessOverlay.Core.Settings;
-using AccessOverlay.Core.Speech;
 
 namespace AccessOverlay.App;
 
@@ -22,26 +20,24 @@ public partial class MainWindow : Window
     private readonly AppSettings _settings;
     private readonly SettingsStore _store;
     private readonly HotkeyManager? _hotkey;
-    private readonly HotkeyManager? _gameHotkey;
     private ForegroundWatcher? _watcher;
     private LiveWatcher? _liveWatcher;
     private OverlayWindow? _overlay;
-    private OverlayWindow? _gameOverlay;
     private ReadableDocument? _lastDoc;
     private IntPtr _lastSourceHwnd;
     private bool _lastSourceIsWeb;
-    private System.Windows.Threading.DispatcherTimer _statusTimer;
     private bool _captureInFlight;
-    private bool _gameScanInFlight;
-    private DateTime _lastAutoCapture = DateTime.MinValue;
-    private bool _automationMode;
+    private (IntPtr Hwnd, bool Auto)? _pendingCapture;
+    private bool _webReadInFlight;
+    private bool? _pendingWebReadSilent;
     private bool _pressExecuted;
     private bool _suppressAutoFollowPersistence;
     /// <summary>Set when the user deliberately dismissed the reader; auto-refresh may update it in place but must never re-show it.</summary>
     private bool _userHidden;
     private DateTime _lastContentCapture = DateTime.MinValue;
-    private ReadableDocument? _lastGameDoc;
-    private System.Windows.Threading.DispatcherTimer? _gameAutoReadTimer;
+    private bool _contentDirty;
+    private System.Windows.Threading.DispatcherTimer? _refreshTimer;
+    private bool _lastDocWasOcr;
 
     public MainWindow()
     {
@@ -61,30 +57,16 @@ public partial class MainWindow : Window
         ThemeCombo.SelectedItem = _settings.Theme;
         // Auto-follow is the default: the reader keeps up with new screens by itself.
         AutoFollowCheck.IsChecked = _settings.AutoFollow;
+        // The window being shown always stays current; the checkbox only decides
+        // whether the reader also jumps to other apps.
+        StartLiveRefresh();
         if (_settings.AutoFollow) StartWatcher();
-        SpeakOnCaptureCheck.IsChecked = _settings.SpeakOnCapture;
 
         _hotkey = new HotkeyManager(this, _settings.Hotkey);
         if (_hotkey.IsRegistered)
             _hotkey.HotkeyPressed += HotkeyPressed;
         else
             StatusText.Text = $"Hotkey {_settings.Hotkey} could not be registered (in use elsewhere?).";
-
-        // Ctrl+Alt+G toggles the game window: scans the foreground game with OCR
-        // when shown, and just hides it when it is already visible.
-        _gameHotkey = new HotkeyManager(this, "Ctrl+Alt+G", id: 0x0A10);
-        if (_gameHotkey.IsRegistered)
-            _gameHotkey.HotkeyPressed += GameHotkeyPressed;
-        else
-            StatusText.Text += " Ctrl+Alt+G could not be registered (in use elsewhere?).";
-
-        // This hidden host now waits for the global hotkey.
-        _statusTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
-        _statusTimer.Tick += (_, _) => UpdateNvdaStatus();
-        _statusTimer.Start();
-        UpdateNvdaStatus();
-
-        App.Speech.OutputChanged += name => NvdaStatusText.Text = $"Reading via {name}";
 
         _ = InitWebViewAsync();
     }
@@ -106,7 +88,6 @@ public partial class MainWindow : Window
         var hwnd = NativeMethods.GetForegroundWindow();
         if (hwnd != IntPtr.Zero && GetPid(hwnd) != Environment.ProcessId && !IsShellOrDesktop(hwnd))
         {
-            Log($"startup capturing fg=0x{hwnd.ToInt64():X} '{NativeMethods.GetWindowTextSafe(hwnd)}'");
             CaptureWindow(hwnd, auto: true);
         }
         _overlay!.ShowOverlayNoActivate();
@@ -121,7 +102,6 @@ public partial class MainWindow : Window
             if (!string.IsNullOrEmpty(webArg))
             {
                 // Debug/automation mode: --web <url> preloads a page and reads it automatically.
-                _automationMode = true;
                 _suppressAutoFollowPersistence = true;
                 UrlBox.Text = webArg;
                 WebReadAfterLoadCheck.IsChecked = true;
@@ -136,23 +116,22 @@ public partial class MainWindow : Window
         }
     }
 
-    private static void Log(string message)
+    private void StartLiveRefresh()
     {
         try
         {
-            System.IO.File.AppendAllText(
-                System.IO.Path.Combine(System.IO.Path.GetTempPath(), "accessoverlay-diag.log"),
-                $"{DateTime.Now:HH:mm:ss.fff} {message}\n");
+            _liveWatcher = new LiveWatcher(TimeSpan.FromMilliseconds(600));
+            _liveWatcher.ContentChanged += OnContentChanged;
         }
-        catch { }
-    }
+        catch
+        {
+            // The timer below still refreshes on its regular interval.
+            StatusText.Text = "Content watching unavailable.";
+        }
 
-    private void UpdateNvdaStatus()
-    {
-        var ok = App.Speech.NvdaAvailable;
-        NvdaStatusText.Text = ok
-            ? $"NVDA: connected ({App.Speech.CurrentOutput})"
-            : "NVDA: not running â€” using Windows SAPI";
+        _refreshTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _refreshTimer.Tick += RefreshTimer_Tick;
+        _refreshTimer.Start();
     }
 
     private void StartWatcher()
@@ -167,18 +146,6 @@ public partial class MainWindow : Window
         {
             StatusText.Text = "Foreground watching unavailable.";
         }
-
-        try
-        {
-            _liveWatcher ??= new LiveWatcher(TimeSpan.FromMilliseconds(600));
-            _liveWatcher.ContentChanged -= OnContentChanged;
-            _liveWatcher.ContentChanged += OnContentChanged;
-            _liveWatcher.Track(_lastSourceHwnd);
-        }
-        catch
-        {
-            StatusText.Text = "Content watching unavailable.";
-        }
     }
 
     private void StopWatcher()
@@ -189,37 +156,45 @@ public partial class MainWindow : Window
             _watcher.Dispose();
             _watcher = null;
         }
-        if (_liveWatcher is not null)
-        {
-            _liveWatcher.ContentChanged -= OnContentChanged;
-            _liveWatcher.Dispose();
-            _liveWatcher = null;
-        }
     }
 
     /// <summary>
     /// The window we are showing changed underneath us (new dialog, new page,
-    /// content re-rendered). Re-capture it in place: never steal focus, never
-    /// re-show a reader the user deliberately closed.
+    /// content re-rendered). Only noted here: <see cref="RefreshTimer_Tick"/> does
+    /// the work, so changes during a busy moment are delayed rather than lost.
     /// </summary>
     private void OnContentChanged(IntPtr hwnd)
     {
         if (_lastSourceHwnd == IntPtr.Zero) return;
         if (hwnd != _lastSourceHwnd && !IsChildOf(_lastSourceHwnd, hwnd)) return;
-        if (_overlay is { IsVisible: true, IsEditing: true }) return;
-        if (_captureInFlight) return;
-        // Rate-limit: some apps fire object events continuously (animations,
-        // caret moves); one refresh per second is plenty.
-        if (DateTime.UtcNow - _lastContentCapture < TimeSpan.FromSeconds(1)) return;
-        _lastContentCapture = DateTime.UtcNow;
+        _contentDirty = true;
+    }
 
-        DiagnosticsLogger.Log($"Content changed hwnd=0x{hwnd.ToInt64():X} -> refreshing reader");
+    /// <summary>
+    /// Keeps the reader in step with its source: within a second of a reported
+    /// change, and every few seconds regardless, because web content and some apps
+    /// change without reporting it. Unchanged captures don't touch the reader.
+    /// </summary>
+    private void RefreshTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_overlay is not { IsVisible: true, IsEditing: false }) return;
+        if (_lastSourceHwnd == IntPtr.Zero || _captureInFlight || _webReadInFlight) return;
+        if (!_lastSourceIsWeb && (!NativeMethods.IsWindow(_lastSourceHwnd) || NativeMethods.IsIconic(_lastSourceHwnd))) return;
+
+        var sinceLast = DateTime.UtcNow - _lastContentCapture;
+        // A screen read hides the reader for its picture, so it stays occasional.
+        var due = _lastDocWasOcr
+            ? _contentDirty && sinceLast >= TimeSpan.FromSeconds(5) && !_overlay.IsActive
+            : _contentDirty || sinceLast >= TimeSpan.FromSeconds(3);
+        if (!due) return;
+
+        _contentDirty = false;
+        _lastContentCapture = DateTime.UtcNow;
+        DiagnosticsLogger.Log("Auto-refreshing reader");
         if (_lastSourceIsWeb)
-        {
             ReadCurrentWebPage(silent: true);
-            return;
-        }
-        CaptureWindow(_lastSourceHwnd, auto: true);
+        else
+            CaptureWindow(_lastSourceHwnd, auto: true);
     }
 
     private static bool IsChildOf(IntPtr parent, IntPtr hwnd)
@@ -230,14 +205,11 @@ public partial class MainWindow : Window
 
     private void OnForegroundChanged(IntPtr hwnd)
     {
-        DiagnosticsLogger.Log($"Foreground changed hwnd=0x{hwnd.ToInt64():X} title='{NativeMethods.GetWindowTextSafe(hwnd)}'");
-        Log($"fg-change 0x{hwnd.ToInt64():X} '{NativeMethods.GetWindowTextSafe(hwnd)}'");
+        DiagnosticsLogger.Log($"Foreground changed hwnd=0x{hwnd.ToInt64():X}");
         if (hwnd == IntPtr.Zero) return;
         var pid = GetPid(hwnd);
         if (pid == Environment.ProcessId) return;
         if (IsShellOrDesktop(hwnd)) return;
-        if (DateTime.UtcNow - _lastAutoCapture < TimeSpan.FromMilliseconds(900)) return;
-        _lastAutoCapture = DateTime.UtcNow;
         CaptureWindow(hwnd, auto: true);
     }
 
@@ -258,10 +230,15 @@ public partial class MainWindow : Window
     private void HotkeyPressed()
     {
         DiagnosticsLogger.Log("Global hotkey pressed");
-        // Ctrl+Alt+A toggles the main reader window. Hidden → capture the focused
-        // app and show it; visible → hide it.
+        // Ctrl+Alt+A: hidden -> capture the focused app and show it; showing behind
+        // another app -> move the keyboard into it; already in it -> hide it.
         if (_overlay?.IsVisible == true)
         {
+            if (!_overlay.IsActive)
+            {
+                _overlay.FocusReader();
+                return;
+            }
             _overlay.Hide();
             _userHidden = true;
             return;
@@ -279,30 +256,41 @@ public partial class MainWindow : Window
         CaptureWindow(hwnd, auto: false);
     }
 
-    private void GameHotkeyPressed()
-    {
-        DiagnosticsLogger.Log("Game hotkey pressed");
-        // Ctrl+Alt+G toggles the separate game window. Hidden → OCR-scan the
-        // focused game and show it; visible → hide it.
-        if (_gameOverlay?.IsVisible == true)
-        {
-            _gameOverlay.Hide();
-            return;
-        }
-
-        GameScanAsync();
-    }
-
     private void CaptureBtn_Click(object sender, RoutedEventArgs e)
     {
         var hwnd = NativeMethods.GetForegroundWindow();
         CaptureWindow(hwnd, auto: false);
     }
 
-    private void CaptureWindow(IntPtr hwnd, bool auto)
+    private async void CaptureWindow(IntPtr hwnd, bool auto)
     {
-        if (hwnd == IntPtr.Zero || _captureInFlight) return;
+        if (hwnd == IntPtr.Zero) return;
+        if (_captureInFlight)
+        {
+            // Dropping this would leave the reader on an out-of-date screen. Only the
+            // newest request matters, but an explicit one stays explicit.
+            _pendingCapture = (hwnd, auto && (_pendingCapture?.Auto ?? true));
+            return;
+        }
+
         _captureInFlight = true;
+        try
+        {
+            await CaptureWindowCoreAsync(hwnd, auto);
+        }
+        finally
+        {
+            _captureInFlight = false;
+            if (_pendingCapture is { } next)
+            {
+                _pendingCapture = null;
+                CaptureWindow(next.Hwnd, next.Auto);
+            }
+        }
+    }
+
+    private async Task CaptureWindowCoreAsync(IntPtr hwnd, bool auto)
+    {
         StatusText.Text = "Capturing…";
         DiagnosticsLogger.Log($"CaptureWindow started hwnd=0x{hwnd.ToInt64():X} auto={auto}");
 
@@ -328,8 +316,8 @@ public partial class MainWindow : Window
         }
         catch { /* window vanished; capture the top-level and let it fail normally */ }
 
-        var sourceLabel = "Foreground app";
-        Task.Run(() =>
+        const string sourceLabel = "Foreground app";
+        var r = await Task.Run(() =>
         {
             try
             {
@@ -348,33 +336,35 @@ public partial class MainWindow : Window
             {
                 return (Ok: false, Doc: (ReadableDocument?)null, Title: ex.Message);
             }
-        }).ContinueWith(t =>
+        });
+
+        if (!r.Ok || r.Doc is null)
         {
-            _captureInFlight = false;
-            var r = t.Result;
-            if (!r.Ok || r.Doc is null)
-            {
-                StatusText.Text = $"Capture failed: {r.Title}";
-                return;
-            }
+            StatusText.Text = $"Capture failed: {r.Title}";
+            return;
+        }
 
-            // Custom-drawn interfaces expose (at best) a nearly empty UIA tree.
-            // Fall back to reading the screen itself so the content is still
-            // usable, with every line clickable.
-            if (IsThinDocument(r.Doc))
-            {
-                DiagnosticsLogger.Log("UIA tree too thin; falling back to screen OCR");
-                CaptureViaOcrFallback(hwnd, auto, r.Title);
-                return;
-            }
+        // Custom-drawn interfaces expose (at best) a nearly empty UIA tree.
+        // Fall back to reading the screen itself so the content is still
+        // usable, with every line clickable.
+        if (IsThinDocument(r.Doc))
+        {
+            DiagnosticsLogger.Log("UIA tree too thin; falling back to screen OCR");
+            await CaptureViaOcrFallback(hwnd, auto, r.Title);
+            return;
+        }
 
-            ApplyCapturedDoc(r.Doc, hwnd, auto, r.Title);
-        }, TaskScheduler.FromCurrentSynchronizationContext());
+        ApplyCapturedDoc(r.Doc, hwnd, auto, r.Title);
     }
 
     /// <summary>True when a capture found essentially nothing worth showing.</summary>
+    /// <remarks>
+    /// A short form is not thin: OCR output can't be typed into, so a document with
+    /// a real edit field must stay on the accessibility path.
+    /// </remarks>
     private static bool IsThinDocument(ReadableDocument doc)
-        => doc.Blocks.Count < 3 || doc.PlainText.Trim().Length < 60;
+        => (doc.Blocks.Count < 3 || doc.PlainText.Trim().Length < 60)
+           && !doc.Blocks.Any(b => b is ControlBlock { Role: "edit field" });
 
     /// <summary>
     /// Last resort for interfaces that do not expose their content through
@@ -382,16 +372,18 @@ public partial class MainWindow : Window
     /// screenshot the window, OCR it, and present the result. Every OCR line is
     /// clickable through the existing coordinate-click path.
     /// </summary>
-    private async void CaptureViaOcrFallback(IntPtr hwnd, bool auto, string title)
+    private async Task CaptureViaOcrFallback(IntPtr hwnd, bool auto, string title)
     {
+        if (_overlay?.IsEditing == true) return;
         var wasVisible = _overlay?.IsVisible == true;
+        var wasActive = _overlay?.IsActive == true;
         if (wasVisible) _overlay!.Hide();
         await Task.Delay(250); // let the screen repaint without us in the way
 
         ReadableDocument doc;
         try
         {
-            doc = await OcrCaptureService.CaptureAsync(hwnd, 0.70f, gameMode: false);
+            doc = await OcrCaptureService.CaptureAsync(hwnd);
         }
         catch (Exception ex)
         {
@@ -403,6 +395,8 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(title) == false)
             doc.Title = title;
         ApplyCapturedDoc(doc, hwnd, auto, title, ocrFallback: true);
+        if (wasVisible && !_overlay!.IsVisible) _overlay.ShowOverlayNoActivate();
+        if (wasActive) _overlay!.FocusReader();
     }
 
     private void ApplyCapturedDoc(ReadableDocument doc, IntPtr hwnd, bool auto, string title, bool ocrFallback = false)
@@ -410,6 +404,7 @@ public partial class MainWindow : Window
         _lastDoc = doc;
         _lastSourceHwnd = hwnd;
         _lastSourceIsWeb = false;
+        _lastDocWasOcr = ocrFallback;
         _liveWatcher?.Track(hwnd);
         LastSourceText.Text = doc.Title;
         LastSummaryText.Text = $"{doc.Blocks.Count} blocks · {doc.PlainText.Length:N0} characters";
@@ -424,38 +419,22 @@ public partial class MainWindow : Window
             if (_userHidden) return; // user dismissed the reader; don't pop back up
 
             // The overlay runs on its own: first capture opens it without stealing focus.
-            var ov = EnsureOverlay(doc);
-            ov.ShowOverlayNoActivate();
-            if (_settings.SpeakOnCapture)
-                AnnounceNowShowing(doc);
+            EnsureOverlay(doc).ShowOverlayNoActivate();
         }
         else
         {
             var ov = EnsureOverlay(doc);
             PositionNear(ov, hwnd);
-            if (_settings.SpeakOnCapture && !string.IsNullOrWhiteSpace(doc.PlainText))
-            {
-                App.Speech.Speak($"{doc.Title}. {doc.PlainText}");
-            }
             ov.ShowAndFocusFirst();
         }
         StatusText.Text = ocrFallback ? $"Captured (screen read): {title}" : $"Captured: {title}";
-    }
-
-    private static void AnnounceNowShowing(ReadableDocument doc)
-    {
-        var count = doc.Blocks.Count(b => b is ControlBlock);
-        var line = string.IsNullOrWhiteSpace(doc.Title)
-            ? "Access overlay is following this window."
-            : $"Now showing {doc.Title}. {count} buttons and links available. Tab into the reader to move through them.";
-        App.Speech.Speak(line);
     }
 
     private OverlayWindow EnsureOverlay(ReadableDocument doc)
     {
         if (_overlay is null)
         {
-            _overlay = new OverlayWindow(doc, App.Speech);
+            _overlay = new OverlayWindow(doc);
             _overlay.ControlActivated += OnControlActivated;
             _overlay.RefreshRequested += OnRefreshRequested;
             _overlay.ControlPanelRequested += (_, _) => ShowControlPanel();
@@ -466,26 +445,6 @@ public partial class MainWindow : Window
             _overlay.UpdateDocument(doc);
         }
         return _overlay;
-    }
-
-    /// <summary>
-    /// The game scan has its own window, separate from the app/website reader.
-    /// Ctrl+Alt+G shows and hides it; auto-read polls update it silently.
-    /// </summary>
-    private OverlayWindow EnsureGameOverlay(ReadableDocument doc)
-    {
-        if (_gameOverlay is null)
-        {
-            _gameOverlay = new OverlayWindow(doc, App.Speech);
-            _gameOverlay.ControlActivated += (_, _) => GameScanAsync(silent: true);
-            _gameOverlay.RefreshRequested += (_, _) => GameScanAsync(silent: true);
-            _gameOverlay.ControlPanelRequested += (_, _) => ShowControlPanel();
-        }
-        else
-        {
-            _gameOverlay.UpdateDocument(doc);
-        }
-        return _gameOverlay;
     }
 
     /// <summary>
@@ -523,13 +482,21 @@ public partial class MainWindow : Window
 
     private void PositionNear(OverlayWindow overlay, IntPtr hwnd)
     {
+        // Once the user has a place for the reader, it stays there.
+        if (overlay.HasSavedPosition) return;
         if (!NativeMethods.GetWindowRect(hwnd, out var rect)) return;
+
+        // GetWindowRect is in device pixels; WPF window placement isn't.
+        var toDip = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformFromDevice ?? System.Windows.Media.Matrix.Identity;
+        var topLeft = toDip.Transform(new Point(rect.Left, rect.Top));
+        var bottomRight = toDip.Transform(new Point(rect.Right, rect.Bottom));
+
         var work = SystemParameters.WorkArea;
-        var w = Math.Min(_settings.WindowWidth, work.Width * 0.92);
-        var h = Math.Min(_settings.WindowHeight, work.Height * 0.92);
-        double left = rect.Right - 40;
-        if (left + w > work.Right) left = Math.Max(work.Left, rect.Left + 40 - w);
-        var top = Math.Max(work.Top, rect.Top + 30);
+        var w = Math.Min(overlay.Width, work.Width * 0.92);
+        var h = Math.Min(overlay.Height, work.Height * 0.92);
+        double left = bottomRight.X - 40;
+        if (left + w > work.Right) left = Math.Max(work.Left, topLeft.X + 40 - w);
+        var top = Math.Max(work.Top, topLeft.Y + 30);
         if (top + h > work.Bottom) top = Math.Max(work.Top, work.Bottom - h - 20);
         overlay.Left = Math.Max(work.Left, left);
         overlay.Top = top;
@@ -541,7 +508,7 @@ public partial class MainWindow : Window
     {
         if (_lastDoc is null)
         {
-            StatusText.Text = "Nothing captured yet â€” press Ctrl+Alt+A or click Capture.";
+            StatusText.Text = "Nothing captured yet — press Ctrl+Alt+A or click Capture.";
             return;
         }
         _userHidden = false;
@@ -560,12 +527,6 @@ public partial class MainWindow : Window
         {
             StatusText.Text = "Clipboard busy, try again.";
         }
-    }
-
-    private void TestSpeech_Click(object sender, RoutedEventArgs e)
-    {
-        App.Speech.Speak("Access overlay connected. This text is being read through the fixed, readable pipeline.");
-        UpdateNvdaStatus();
     }
 
     private void FontSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -603,12 +564,6 @@ public partial class MainWindow : Window
         _store.Save(_settings);
     }
 
-    private void SpeakOnCapture_Changed(object sender, RoutedEventArgs e)
-    {
-        _settings.SpeakOnCapture = SpeakOnCaptureCheck.IsChecked == true;
-        _store.Save(_settings);
-    }
-
     private async void WebGo_Click(object sender, RoutedEventArgs e)
     {
         await NavigateToUrl(UrlBox.Text);
@@ -636,7 +591,7 @@ public partial class MainWindow : Window
     {
         var url = NormalizeUrl(raw);
         if (url.Length == 0) return;
-        StatusText.Text = $"Loading {url}â€¦";
+        StatusText.Text = $"Loading {url}…";
         try
         {
             await WebView.EnsureCoreWebView2Async();
@@ -651,7 +606,7 @@ public partial class MainWindow : Window
     private void WebView_NavigationCompleted(object? sender, Microsoft.Web.WebView2.Core.CoreWebView2NavigationCompletedEventArgs e)
     {
         if (!e.IsSuccess) return;
-        StatusText.Text = "Page loaded â€” extracting readable viewâ€¦";
+        StatusText.Text = "Page loaded — extracting readable view…";
         if (WebReadAfterLoadCheck.IsChecked == true)
         {
             // Give the page a moment to finish rendering its accessibility tree.
@@ -677,6 +632,30 @@ public partial class MainWindow : Window
             StatusText.Text = "Open a page first.";
             return;
         }
+        if (_webReadInFlight)
+        {
+            _pendingWebReadSilent = (_pendingWebReadSilent ?? true) && silent;
+            return;
+        }
+
+        _webReadInFlight = true;
+        try
+        {
+            await ReadCurrentWebPageCoreAsync(silent);
+        }
+        finally
+        {
+            _webReadInFlight = false;
+            if (_pendingWebReadSilent is { } nextSilent)
+            {
+                _pendingWebReadSilent = null;
+                ReadCurrentWebPage(nextSilent);
+            }
+        }
+    }
+
+    private async Task ReadCurrentWebPageCoreAsync(bool silent)
+    {
         DiagnosticsLogger.Log($"ReadCurrentWebPage started url={UrlBox.Text}");
         var hostHwnd = new WindowInteropHelper(this).Handle;
         var webHwnd = NativeMethods.FindWebView2Hwnd(hostHwnd);
@@ -695,28 +674,31 @@ public partial class MainWindow : Window
             return;
         }
 
-        StatusText.Text = "Extracting page contentâ€¦";
+        StatusText.Text = "Extracting page content…";
         try
         {
-            // WebView2's accessibility tree lives in our process, so capture on the UI thread.
-            // Chromium builds its UIA tree lazily: the first full request triggers generation,
-            // so warm up once, then capture for real.
-            UiaCaptureService.CaptureWindow(webHwnd);
-            await Task.Delay(silent ? 800 : 1200);
-            var raw = UiaCaptureService.CaptureWindow(webHwnd);
+            // Chromium builds its UIA tree lazily: the first full request triggers
+            // generation, so warm up once, then capture for real.
+            var raw = await Task.Run(async () =>
+            {
+                UiaCaptureService.CaptureWindow(webHwnd);
+                await Task.Delay(silent ? 800 : 1200);
+                return UiaCaptureService.CaptureWindow(webHwnd);
+            });
             var doc = DocumentNormalizer.Normalize(raw,
                 title: WebView.CoreWebView2.DocumentTitle ?? UrlBox.Text,
                 source: "Website");
             _lastDoc = doc;
             _lastSourceHwnd = webHwnd;
             _lastSourceIsWeb = true;
+            _lastDocWasOcr = false;
             _liveWatcher?.Track(webHwnd);
             LastSourceText.Text = doc.Title;
             LastSummaryText.Text = $"{doc.Blocks.Count} blocks · {doc.PlainText.Length:N0} characters";
 
             if (string.IsNullOrWhiteSpace(doc.PlainText))
             {
-                StatusText.Text = "Extracted no readable text â€” the page may block automation. Try waiting longer.";
+                StatusText.Text = "Extracted no readable text — the page may block automation. Try waiting longer.";
                 return;
             }
 
@@ -724,8 +706,6 @@ public partial class MainWindow : Window
             if (!silent)
             {
                 PositionNear(ov, hostHwnd);
-                if (_settings.SpeakOnCapture)
-                    App.Speech.Speak($"{doc.Title}. {doc.PlainText}");
                 ov.ShowAndFocusFirst();
                 if (!_pressExecuted)
                 {
@@ -752,7 +732,6 @@ public partial class MainWindow : Window
         // The close button only dismisses the optional control panel.
         // The hidden host must remain alive so the global hotkey continues to work.
         e.Cancel = true;
-        _gameAutoReadTimer?.Stop();
         Hide();
     }
 
@@ -762,131 +741,18 @@ public partial class MainWindow : Window
     /// </summary>
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
+        if (e.Key == Key.F7)
+        {
+            e.Handled = true;
+            DiagnosticsLogger.Enabled = !DiagnosticsLogger.Enabled;
+            StatusText.Text = DiagnosticsLogger.Enabled ? "Debug logging on." : "Debug logging off.";
+            return;
+        }
+
         if (e.Key == Key.Enter && Keyboard.FocusedElement is Button btn)
         {
             e.Handled = true;
             btn.RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
-        }
-    }
-
-    // ─── Game Scan ────────────────────────────────────────────────────────────
-
-    private void GameScanBtn_Click(object sender, RoutedEventArgs e) => GameScanAsync();
-
-    private void GameSpeakAll_Click(object sender, RoutedEventArgs e)
-    {
-        if (_lastGameDoc is null) { GameStatusText.Text = "Scan a game first."; return; }
-        App.Speech.Speak(_lastGameDoc.PlainText);
-    }
-
-    private void GameAutoRead_Changed(object sender, RoutedEventArgs e)
-    {
-        if (GameAutoReadCheck.IsChecked == true)
-        {
-            _gameAutoReadTimer ??= new System.Windows.Threading.DispatcherTimer
-            {
-                Interval = TimeSpan.FromSeconds(2.5),
-            };
-            _gameAutoReadTimer.Tick += GameAutoReadTimer_Tick;
-            _gameAutoReadTimer.Start();
-            GameStatusText.Text = "Auto-announcing new game text every 2.5 s.";
-        }
-        else
-        {
-            if (_gameAutoReadTimer is not null)
-            {
-                _gameAutoReadTimer.Tick -= GameAutoReadTimer_Tick;
-                _gameAutoReadTimer.Stop();
-            }
-            GameStatusText.Text = string.Empty;
-        }
-    }
-
-    private void GameAutoReadTimer_Tick(object? sender, EventArgs e) => GameScanAsync(silent: true);
-
-    /// <summary>
-    /// Captures the current foreground window using OCR and shows the result in the reader overlay.
-    /// Works with any game engine: Frostbite, Unreal Engine, Source, Unity, id Tech, etc.
-    /// Frostbite detection: looks for EA/DICE process names and adjusts confidence thresholds.
-    /// </summary>
-    private async void GameScanAsync(bool silent = false)
-    {
-        if (_gameScanInFlight) return;
-        _gameScanInFlight = true;
-        if (!silent) GameStatusText.Text = "Scanning game screen\u2026";
-
-        // Snapshot the foreground window *before* we lose it
-        var hwnd = NativeMethods.GetForegroundWindow();
-        var procName = string.Empty;
-        try
-        {
-            NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
-            procName = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant();
-        }
-        catch { }
-
-        // Frostbite engine games: bf2042, battlefield*, fifa*, nhl*, nba*, etc.
-        // Frostbite renders entirely via DirectX/DX11 with no UIA accessibility tree —
-        // OCR is the only way in, so we reduce the confidence threshold for sparser layouts.
-        var isFrostbite = procName is "bf2042" or "bf1" or "bfv" or "bfm"
-            || procName.StartsWith("battlefield", StringComparison.Ordinal)
-            || procName.StartsWith("fifa", StringComparison.Ordinal)
-            || procName.StartsWith("nhl", StringComparison.Ordinal)
-            || procName.StartsWith("nba", StringComparison.Ordinal)
-            || procName.StartsWith("starwars", StringComparison.Ordinal)
-            || procName is "masseffect" or "dragonage" or "anthem";
-
-        float minConfidence = isFrostbite ? 0.55f : 0.70f;
-
-        try
-        {
-            DiagnosticsLogger.Log($"Game scan triggered hwnd=0x{hwnd.ToInt64():X} proc={procName} minConfidence={minConfidence}");
-            var doc = await Task.Run(() =>
-                OcrCaptureService.CaptureAsync(hwnd, minConfidence, true).GetAwaiter().GetResult());
-
-            _lastGameDoc = doc;
-
-            var blockCount = doc.Blocks.Count;
-            var engineTag = isFrostbite ? " [Frostbite]" : string.Empty;
-            GameStatusText.Text = $"Found {blockCount} text element{(blockCount == 1 ? "" : "s")}{engineTag}.";
-            LastSourceText.Text = doc.Title;
-            LastSummaryText.Text = $"{blockCount} game blocks \u00b7 {doc.PlainText.Length:N0} chars";
-
-            if (blockCount == 0)
-            {
-                if (!silent) App.Speech.Speak("No text found on screen. Try again when a menu is open.");
-                return;
-            }
-
-            // Diff against last game scan; only speak new content during auto-poll
-            var prevText = _lastGameDoc?.PlainText ?? string.Empty;
-            var newText = doc.PlainText;
-            var changed = string.IsNullOrWhiteSpace(prevText)
-                || !string.Equals(prevText.Trim(), newText.Trim(), StringComparison.OrdinalIgnoreCase);
-
-            _lastGameDoc = doc;
-            _lastDoc = doc;
-            _lastSourceIsWeb = false;
-            _lastSourceHwnd = hwnd;
-
-            // Game scans live in their own window. Manual scans show and focus it;
-            // silent auto-read polls only update it (never re-show it after a hide).
-            var ov = EnsureGameOverlay(doc);
-            if (!silent)
-                ov.ShowAndFocusFirst();
-
-            if (!silent)
-                App.Speech.Speak($"Game scan complete. {blockCount} menu item{(blockCount == 1 ? "" : "s")} found.");
-            else if (changed && !string.IsNullOrWhiteSpace(newText))
-                App.Speech.Speak(newText);
-        }
-        catch (Exception ex)
-        {
-            GameStatusText.Text = $"Scan failed: {ex.Message}";
-        }
-        finally
-        {
-            _gameScanInFlight = false;
         }
     }
 }

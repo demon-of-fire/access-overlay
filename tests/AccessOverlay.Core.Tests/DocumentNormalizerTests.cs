@@ -305,4 +305,19 @@ public class DocumentNormalizerTests
         Assert.Equal("Compose button", doc.Blocks[3].Text);
         Assert.Equal("Search mail edit field", doc.Blocks[4].Text);
     }
+
+    [Fact]
+    public void WritableDocument_GetsEditRowThenReadableText()
+    {
+        var root = new RawNode { ControlType = "Window" };
+        root.Children.Add(new RawNode { ControlType = "Document", Name = "Text editor", Value = "First line.\nSecond line.", IsWritableDocument = true });
+
+        var doc = DocumentNormalizer.Normalize(root);
+
+        var row = Assert.IsType<ControlBlock>(doc.Blocks[0]);
+        Assert.Equal("edit field", row.Role);
+        Assert.Equal("Text editor edit field", row.Text);
+        Assert.Equal("First line.", doc.Blocks[1].Text);
+        Assert.Equal("Second line.", doc.Blocks[2].Text);
+    }
 }

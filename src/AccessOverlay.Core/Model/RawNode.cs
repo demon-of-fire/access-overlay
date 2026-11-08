@@ -32,6 +32,9 @@ public sealed class RawNode
     /// <summary>True when the underlying control contains a protected password value.</summary>
     public bool IsPassword { get; set; }
 
+    /// <summary>True for a document the user can type into, as opposed to a read-only page.</summary>
+    public bool IsWritableDocument { get; set; }
+
     /// <summary>
     /// Opaque handle to the underlying platform element (e.g. a UIA AutomationElement).
     /// Not touched by the normalizer; carried through so controls can be activated later.

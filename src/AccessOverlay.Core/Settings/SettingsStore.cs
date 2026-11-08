@@ -9,10 +9,13 @@ public sealed class AppSettings
     public string Theme { get; set; } = "HighContrast";
     public double Opacity { get; set; } = 0.92;
     public bool AutoFollow { get; set; } = true;
-    public bool SpeakOnCapture { get; set; } = true;
     public string Hotkey { get; set; } = "Ctrl+Alt+A";
     public double WindowWidth { get; set; } = 760;
     public double WindowHeight { get; set; } = 640;
+    public double? ReaderLeft { get; set; }
+    public double? ReaderTop { get; set; }
+    public double? ReaderWidth { get; set; }
+    public double? ReaderHeight { get; set; }
 }
 
 /// <summary>JSON settings persisted under %APPDATA%\AccessOverlay\settings.json.</summary>

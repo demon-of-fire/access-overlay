@@ -92,6 +92,12 @@ public static class DocumentNormalizer
             return;
         }
 
+        if (node.IsWritableDocument)
+        {
+            EmitWritableDocument(node, parentText, depth, blocks);
+            return;
+        }
+
         if (ControlTypes.Contains(node.ControlType))
         {
             EmitControl(node, text, depth, blocks);
@@ -202,6 +208,25 @@ public static class DocumentNormalizer
         }
         if (start < text.Length)
             yield return text[start..];
+    }
+
+    /// <summary>One row to edit the document, followed by its content to read.</summary>
+    private static void EmitWritableDocument(RawNode node, string parentText, int depth, List<ContentBlock> blocks)
+    {
+        var clampedDepth = Math.Min(depth, MaxDepth);
+        Push(blocks, new ControlBlock
+        {
+            Text = $"{Clean(node.Name) ?? "Document"} edit field",
+            Role = "edit field",
+            Depth = clampedDepth,
+            RuntimeTarget = node.RuntimeTarget,
+        });
+
+        var before = blocks.Count;
+        foreach (var child in node.Children)
+            Walk(child, parentText, clampedDepth, blocks);
+        if (blocks.Count == before)
+            EmitParagraphs(node.Value, clampedDepth, blocks);
     }
 
     private static void EmitControl(RawNode node, string text, int depth, List<ContentBlock> blocks)

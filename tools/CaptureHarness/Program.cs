@@ -1,13 +1,11 @@
 ﻿using System.Runtime.InteropServices;
 using AccessOverlay.Core.AppCapture;
 using AccessOverlay.Core.Normalization;
-using AccessOverlay.Core.Nvda;
 
 // CLI tool for inspecting what the overlay pipeline produces from a real window.
 // Usage: CaptureHarness [window-title-substring]
 //   - captures the window whose title contains the substring (default: foreground window)
 
-var speak = args.Contains("--speak");
 var dumpTree = args.Contains("--tree");
 var dumpWindows = args.Contains("--window-hierarchy");
 var webviewOf = args.Contains("--webview-of");
@@ -54,16 +52,6 @@ if (webviewOf)
 
 var title = UiaCaptureService.GetWindowTitle(hwnd);
 Console.WriteLine($"=== Capturing window: {title} (hwnd 0x{hwnd.ToInt64():X}) ===");
-Console.WriteLine($"NVDA running: {NvdaClient.IsRunning}");
-if (NvdaClient.IsRunning)
-{
-    Console.WriteLine($"NVDA pid: {NvdaClient.GetProcessId()}");
-    if (speak)
-    {
-        Console.WriteLine("Asking NVDA to speak a test phrase…");
-        Console.WriteLine($"nvdaController_speakText result: {(NvdaClient.Speak("Access overlay connected. This is spoken through NVDA.", interrupt: false) ? "0 (ok)" : "failed")}");
-    }
-}
 
 try
 {

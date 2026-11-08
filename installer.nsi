@@ -15,6 +15,10 @@ RequestExecutionLevel user
 !insertmacro MUI_LANGUAGE "English"
 
 Section "Install"
+  ; A running copy would lock the exe and make an upgrade fail.
+  nsExec::Exec 'taskkill /F /IM AccessOverlay.App.exe'
+  Sleep 500
+
   SetOutPath "$INSTDIR"
   File "publish\AccessOverlay\AccessOverlay.App.exe"
 
@@ -31,6 +35,9 @@ Section "Install"
 SectionEnd
 
 Section "Uninstall"
+  nsExec::Exec 'taskkill /F /IM AccessOverlay.App.exe'
+  Sleep 500
+
   Delete "$SMPROGRAMS\Access Overlay\Access Overlay.lnk"
   RMDir "$SMPROGRAMS\Access Overlay"
   Delete "$DESKTOP\Access Overlay.lnk"

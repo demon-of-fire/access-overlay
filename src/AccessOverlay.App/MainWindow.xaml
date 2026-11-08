@@ -27,13 +27,7 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal">
                     <Button x:Name="CaptureBtn" Content="Capture foreground app (Ctrl+Alt+A)" Click="CaptureBtn_Click" FontWeight="SemiBold"/>
-                    <Button x:Name="GameScanBtn" Content="🎮 Game Scan (Ctrl+Alt+G)" Click="GameScanBtn_Click" Margin="8,0,0,0" FontWeight="SemiBold"/>
                     <CheckBox x:Name="AutoFollowCheck" Content="Auto-follow app" Margin="12,0,0,0" VerticalAlignment="Center" Checked="AutoFollow_Changed" Unchecked="AutoFollow_Changed"/>
-                    <CheckBox x:Name="SpeakOnCaptureCheck" Content="Speak on capture" Margin="12,0,0,0" VerticalAlignment="Center" Checked="SpeakOnCapture_Changed" Unchecked="SpeakOnCapture_Changed"/>
-                </StackPanel>
-                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock x:Name="NvdaStatusText" Foreground="{DynamicResource MutedBrush}" VerticalAlignment="Center"/>
-                    <Button x:Name="TestSpeechBtn" Content="Test speech" Margin="12,0,0,0" Click="TestSpeech_Click" Padding="8,3"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -76,17 +70,6 @@
                         <Button x:Name="WebReadBtn" Content="Read page" Click="WebRead_Click" Padding="8,3" Margin="8,0,0,0"/>
                     </StackPanel>
                     <CheckBox x:Name="WebReadAfterLoadCheck" Content="Read automatically after load" Margin="0,8,0,0"/>
-
-                    <TextBlock Text="GAMES" Foreground="{DynamicResource AccentBrush}" FontSize="12" FontWeight="Bold" Margin="0,18,0,4"/>
-                    <TextBlock Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="12"
-                               Text="Game Scan uses OCR to read on-screen menus. Works with any game engine including Frostbite, Unreal, Source, and more."/>
-                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                        <Button x:Name="GameScanSideBtn" Content="Scan game now" Click="GameScanBtn_Click" Padding="8,3"/>
-                        <Button x:Name="GameSpeakAllBtn" Content="Read all" Click="GameSpeakAll_Click" Padding="8,3" Margin="8,0,0,0"/>
-                    </StackPanel>
-                    <CheckBox x:Name="GameAutoReadCheck" Content="Auto-announce new game text" Margin="0,8,0,0"
-                              Checked="GameAutoRead_Changed" Unchecked="GameAutoRead_Changed"/>
-                    <TextBlock x:Name="GameStatusText" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="11" Margin="0,4,0,0"/>
                 </StackPanel>
             </Border>
 
